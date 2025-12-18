@@ -11,6 +11,7 @@ use pyrefly_util::telemetry::Telemetry;
 use crate::commands::buck_check::BuckCheckArgs;
 use crate::commands::check::FullCheckArgs;
 use crate::commands::check::SnippetCheckArgs;
+use crate::commands::daemon::DaemonArgs;
 use crate::commands::dump_config::DumpConfigArgs;
 use crate::commands::infer::InferArgs;
 use crate::commands::init::InitArgs;
@@ -48,6 +49,8 @@ pub enum Command {
     Infer(InferArgs),
     /// Generate reports from pyrefly type checking results.
     Report(ReportArgs),
+    /// Run a persistent background daemon for fast incremental type checking.
+    Daemon(DaemonArgs),
 }
 
 impl Command {
@@ -66,6 +69,7 @@ impl Command {
             Command::Infer(args) => args.run(),
             Command::DumpConfig(args) => args.run(),
             Command::Report(args) => args.run(),
+            Command::Daemon(args) => args.run().await,
         }
     }
 }

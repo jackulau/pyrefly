@@ -9,6 +9,8 @@ pub mod all;
 pub mod buck_check;
 pub mod check;
 pub mod config_finder;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod daemon;
 pub mod dump_config;
 pub mod files;
 #[cfg(not(target_arch = "wasm32"))]
