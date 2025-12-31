@@ -362,3 +362,31 @@ assert_type(A.__new__(B), B)
 assert_type(A.__new__(B, 0), B)
     "#,
 );
+
+// Test for https://github.com/facebook/pyrefly/issues/1956
+// When calling a generic function with a union of container types,
+// the type variable should be solved to the union of element types.
+testcase!(
+    test_generic_call_with_union_of_containers,
+    r#"
+from typing import assert_type
+
+x: list[int] | list[str] = ["oops"]
+y: set[int] | set[str] = {"oops"}
+
+# When constructing from a union of containers, the element type should be a union
+assert_type(set(x), set[int | str])
+assert_type(list(y), list[int | str])
+
+# Iterating over a union of containers should yield a union of element types
+def test_iteration(items: list[int] | list[str]) -> None:
+    for item in items:
+        assert_type(item, int | str)
+
+# enumerate should work with unions of containers
+def test_enumerate(items: list[int] | list[str]) -> None:
+    for idx, val in enumerate(items):
+        assert_type(idx, int)
+        assert_type(val, int | str)
+    "#,
+);

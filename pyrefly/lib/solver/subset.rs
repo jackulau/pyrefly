@@ -996,7 +996,27 @@ impl<'a, Ans: LookupAnswer> Subset<'a, Ans> {
             }
             (Type::Intersect(l), u) => any(l.0.iter(), |l| self.is_subset_eq(l, u)),
             (Type::Union(box Union { members: ls, .. }), u) => {
-                all(ls.iter(), |l| self.is_subset_eq(l, u))
+                // When checking a union against a type that may contain type variables,
+                // we need special handling. The first member establishes the type variable
+                // solutions normally (with collecting_union_bounds = false). Subsequent
+                // members union with the existing solutions rather than failing when they
+                // don't exactly match.
+                // For example: list[int] | list[str] <: Iterable[T] should solve T = int | str
+                let was_collecting = self.collecting_union_bounds;
+                let mut first = true;
+                let result = all(ls.iter(), |l| {
+                    if first {
+                        first = false;
+                        // First member: check normally to establish baseline
+                        self.collecting_union_bounds = false;
+                    } else {
+                        // Subsequent members: union with existing solutions
+                        self.collecting_union_bounds = true;
+                    }
+                    self.is_subset_eq(l, u)
+                });
+                self.collecting_union_bounds = was_collecting;
+                result
             }
             (t1, Type::Quantified(q)) => match q.restriction() {
                 // This only works for constraints and not bounds, because a TypeVar must resolve to exactly one of its constraints.

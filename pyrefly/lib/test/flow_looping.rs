@@ -650,9 +650,9 @@ while condition():
 assert_type(good, list[int])
 
 bad = [1]
-while condition():  # E: `list[int] | list[str]` is not assignable to `list[int]` (caused by inconsistent types when breaking cycles)
+while condition():  # E: `list[int] | list[str]` is not assignable to `list[int | str]` (caused by inconsistent types when breaking cycles)
     if condition():
-        bad = [f(bad)]  # E:  Argument `list[int] | list[str]` is not assignable to parameter `x` with type `list[int]` in function `f`
+        bad = [f(bad)]  # E:  Argument `list[int] | list[str]` is not assignable to parameter `x` with type `list[int | str]` in function `f`
     else:
         bad = [""]
 "#,

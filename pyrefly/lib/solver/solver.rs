@@ -61,6 +61,21 @@ const VAR_LEAK: &str = "Internal error: a variable has leaked from one module to
 
 const INITIAL_GAS: Gas = Gas::new(1000);
 
+/// Check if a type is a ParamSpec-related type that shouldn't be unioned.
+/// ParamSpec values represent parameter lists, not single types, so unioning
+/// them (e.g., `ParamSpecValue([int]) | ParamSpecValue([str])`) is semantically invalid.
+fn is_paramspec_related(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::ParamSpecValue(_)
+            | Type::Args(_)
+            | Type::Kwargs(_)
+            | Type::ArgsValue(_)
+            | Type::KwargsValue(_)
+            | Type::Concatenate(_, _)
+    )
+}
+
 #[derive(Debug)]
 enum Variable {
     /// A "partial type" (terminology borrowed from mypy) for an empty container.
@@ -1097,6 +1112,7 @@ impl Solver {
             gas: INITIAL_GAS,
             recursive_assumptions: SmallSet::new(),
             class_protocol_assumptions: SmallSet::new(),
+            collecting_union_bounds: false,
         }
     }
 }
@@ -1301,6 +1317,11 @@ pub struct Subset<'a, Ans: LookupAnswer> {
     /// pairs to detect cycles. This enables coinductive reasoning for recursive protocols
     /// like Functor/Maybe without falsely assuming success for unrelated protocol checks.
     pub class_protocol_assumptions: SmallSet<(Class, Class)>,
+    /// When true, we're processing a union on the LHS. If a type variable has already
+    /// been solved, we should union the new constraint with the existing answer rather
+    /// than checking subset. This handles cases like `list[int] | list[str] <: Iterable[T]`
+    /// where T should be solved to `int | str`, not just `int`.
+    pub collecting_union_bounds: bool,
 }
 
 impl<'a, Ans: LookupAnswer> Subset<'a, Ans> {
@@ -1515,8 +1536,21 @@ impl<'a, Ans: LookupAnswer> Subset<'a, Ans> {
                     Variable::Answer(t2) => {
                         let t2 = t2.clone();
                         drop(v2_ref);
-                        drop(variables);
-                        self.is_subset_eq(t1, &t2)
+                        // When processing a union LHS, we collect bounds by unioning
+                        // rather than checking subset. This allows e.g.:
+                        // list[int] | list[str] <: Iterable[T] to solve T = int | str
+                        if self.collecting_union_bounds
+                            && !is_paramspec_related(&t2)
+                            && !is_paramspec_related(t1)
+                        {
+                            let new_answer = unions(vec![t2, t1.clone()]);
+                            variables.update(*v2, Variable::Answer(new_answer));
+                            drop(variables);
+                            Ok(())
+                        } else {
+                            drop(variables);
+                            self.is_subset_eq(t1, &t2)
+                        }
                     }
                     Variable::Quantified(q) | Variable::PartialQuantified(q) => {
                         let t1_p = t1.clone().promote_literals(self.type_order.stdlib());
