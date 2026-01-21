@@ -2386,3 +2386,22 @@ def f(o: C):
         o.x.foo
     "#,
 );
+
+// Regression test for https://github.com/facebook/pyrefly/issues/2173
+// Starred expressions in list literals should not be treated as type forms.
+testcase!(
+    test_starred_in_membership_test,
+    r#"
+from typing import Literal, assert_type
+X = ["a", "b", "c"]
+Y = "d"
+if Y in [*X, "d", "e", "f"]:
+    pass
+z = "g" if Y in [*X, "d", "e", "f"] else "h"
+assert_type(z, Literal["g", "h"])
+
+# Also test 'not in' with starred expressions
+if Y not in [*X, "d", "e", "f"]:
+    pass
+    "#,
+);

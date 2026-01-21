@@ -660,6 +660,11 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 };
                 let mut literal_types = Vec::new();
                 for expr in exprs {
+                    // Starred expressions can't contribute to literal narrowing and would
+                    // produce confusing errors if passed to expr_infer directly.
+                    if matches!(expr, Expr::Starred(_)) {
+                        return ty.clone();
+                    }
                     let expr_ty = self.expr_infer(&expr, errors);
                     if matches!(expr_ty, Type::Literal(_) | Type::None) {
                         literal_types.push(expr_ty);
@@ -681,6 +686,11 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 };
                 let mut literal_types = Vec::new();
                 for expr in exprs {
+                    // Starred expressions can't contribute to literal narrowing and would
+                    // produce confusing errors if passed to expr_infer directly.
+                    if matches!(expr, Expr::Starred(_)) {
+                        return ty.clone();
+                    }
                     let expr_ty = self.expr_infer(&expr, errors);
                     if matches!(expr_ty, Type::Literal(_) | Type::None) {
                         literal_types.push(expr_ty);
