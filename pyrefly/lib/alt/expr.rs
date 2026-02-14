@@ -17,11 +17,14 @@ use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::callable::FunctionKind;
+use pyrefly_types::dimension::SizeExpr;
+use pyrefly_types::dimension::simplify;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
 use pyrefly_types::typed_dict::ExtraItems;
 use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::typed_dict::TypedDictField;
+use pyrefly_types::types::AnyStyle;
 use pyrefly_types::types::Union;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::SliceExt;
@@ -33,6 +36,7 @@ use ruff_python_ast::BoolOp;
 use ruff_python_ast::Comprehension;
 use ruff_python_ast::DictItem;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprBinOp;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprGenerator;
 use ruff_python_ast::ExprNumberLiteral;
@@ -42,6 +46,7 @@ use ruff_python_ast::ExprTuple;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::Keyword;
 use ruff_python_ast::Number;
+use ruff_python_ast::Operator;
 use ruff_python_ast::StringLiteralValue;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
@@ -68,6 +73,7 @@ use crate::types::callable::Param;
 use crate::types::callable::ParamList;
 use crate::types::callable::Params;
 use crate::types::callable::Required;
+use crate::types::class::Class;
 use crate::types::facet::FacetKind;
 use crate::types::lit_int::LitInt;
 use crate::types::literal::Lit;
@@ -238,23 +244,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     ) -> Type {
         self.expr_infer_type_info_with_hint(x, hint, errors)
             .into_ty()
-    }
-
-    /// Check whether a type corresponds to a deprecated function or method, and if so, log a deprecation warning.
-    pub fn check_for_deprecated_call(&self, ty: &Type, range: TextRange, errors: &ErrorCollector) {
-        let Some(deprecation) = ty.function_deprecation() else {
-            return;
-        };
-        let deprecated_function = ty
-            .to_func_kind()
-            .map(|func_kind| func_kind.format(self.module().name()));
-        if let Some(deprecated_function) = deprecated_function {
-            errors.add(
-                range,
-                ErrorInfo::Kind(ErrorKind::Deprecated),
-                deprecation.as_error_message(format!("`{deprecated_function}` is deprecated")),
-            );
-        }
     }
 
     /// Like expr_infer_with_hint(), but returns a TypeInfo that includes narrowing information.
@@ -641,6 +630,23 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             want.ty().clone()
         } else {
             ty.promote_implicit_literals(self.stdlib)
+        }
+    }
+
+    /// Check whether a type corresponds to a deprecated function or method, and if so, log a deprecation warning.
+    fn check_for_deprecated_call(&self, ty: &Type, range: TextRange, errors: &ErrorCollector) {
+        let Some(deprecation) = ty.function_deprecation() else {
+            return;
+        };
+        let deprecated_function = ty
+            .to_func_kind()
+            .map(|func_kind| func_kind.format(self.module().name()));
+        if let Some(deprecated_function) = deprecated_function {
+            errors.add(
+                range,
+                ErrorInfo::Kind(ErrorKind::Deprecated),
+                deprecation.as_error_message(format!("`{deprecated_function}` is deprecated")),
+            );
         }
     }
 
@@ -1884,6 +1890,10 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         ),
                     }
                 }
+                // Dim type parsing: Dim[3], Dim[N], Dim[N+1] syntax
+                Type::ClassDef(ref cls) if self.is_symint_class(cls) => {
+                    self.parse_symint_type(xs, range, errors)
+                }
                 Type::ClassDef(ref cls)
                     if let Expr::StringLiteral(ExprStringLiteral { value: key, .. }) = slice
                         && self.get_enum_from_class(cls).is_some() =>
@@ -1920,10 +1930,11 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 }
                 Type::ClassDef(cls) => {
                     let metadata = self.get_metadata_for_class(&cls);
-                    let class_getitem_result = if self.get_class_tparams(&cls).is_empty()
+                    let class_ty = Type::ClassDef(cls.dupe());
+                    let allow_dunder_lookup = self.get_class_tparams(&cls).is_empty()
                         && !metadata.has_base_any()
-                        && !metadata.is_new_type()
-                    {
+                        && !metadata.is_new_type();
+                    let class_getitem_result = if allow_dunder_lookup {
                         let class_ty = self.heap.mk_class_def(cls.dupe());
                         // TODO(stroxler): Add a new API, similar to `type_of_attr_get` but returning a
                         // LookupResult or an Optional type, that we could use here to avoid the double lookup.
@@ -1945,7 +1956,21 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     } else {
                         None
                     };
-                    if let Some(result) = class_getitem_result {
+                    let metaclass_getitem_result =
+                        if class_getitem_result.is_none() && allow_dunder_lookup {
+                            self.call_magic_dunder_method(
+                                &class_ty,
+                                &dunder::GETITEM,
+                                range,
+                                &[CallArg::expr(slice)],
+                                &[],
+                                errors,
+                                Some(&|| ErrorContext::Index(self.for_display(class_ty.clone()))),
+                            )
+                        } else {
+                            None
+                        };
+                    if let Some(result) = class_getitem_result.or(metaclass_getitem_result) {
                         result
                     } else {
                         self.heap.mk_type_form(self.specialize(
@@ -2184,6 +2209,178 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 ),
             }
         })
+    }
+
+    fn is_symint_class(&self, cls: &Class) -> bool {
+        cls.has_toplevel_qname("torch_shapes", "Dim")
+    }
+
+    /// Parse a single dimension expression (recursive helper)
+    fn parse_dimension_expr(&self, expr: &Expr, errors: &ErrorCollector) -> Option<Type> {
+        match expr {
+            // String literals are not valid dimensions
+            Expr::StringLiteral(_) => {
+                self.error(
+                    errors,
+                    expr.range(),
+                    ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                    "String literals are not valid tensor dimensions".to_owned(),
+                );
+                None
+            }
+            // Number literal: concrete dimension
+            Expr::NumberLiteral(ExprNumberLiteral { value, .. }) => match value {
+                Number::Int(int_val) => {
+                    if let Some(value) = int_val.as_i64() {
+                        // Allow any integer value during parsing - validation happens later
+                        // This allows expressions like N + 0 where 0 is part of an expression
+                        Some(self.heap.mk_size(SizeExpr::literal(value)))
+                    } else {
+                        self.error(
+                            errors,
+                            expr.range(),
+                            ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                            "Tensor shape dimension too large".to_owned(),
+                        );
+                        None
+                    }
+                }
+                _ => {
+                    self.error(
+                        errors,
+                        expr.range(),
+                        ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                        "Tensor shape dimensions must be integers, not floats or complex numbers"
+                            .to_owned(),
+                    );
+                    None
+                }
+            },
+            // Name expression: could be a type variable
+            Expr::Name(_) => {
+                let expr_type = self.expr_infer(expr, errors);
+
+                match &expr_type {
+                    Type::QuantifiedValue(q) => Some(Type::Quantified(q.clone())),
+                    Type::ClassDef(cls) if cls.has_toplevel_qname("typing", "Any") => {
+                        // typing.Any in a type annotation position (e.g., Tensor[16, Any])
+                        // Use Explicit since the user wrote Any explicitly
+                        Some(Type::Any(AnyStyle::Explicit))
+                    }
+                    _ => {
+                        self.error(
+                            errors,
+                            expr.range(),
+                            ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                            format!(
+                                "Tensor shape dimensions must be integer literals or type variables, got `{}`",
+                                self.for_display(expr_type)
+                            ),
+                        );
+                        None
+                    }
+                }
+            }
+            // Binary operations: N + M, N * M, etc.
+            Expr::BinOp(ExprBinOp {
+                left, op, right, ..
+            }) => {
+                let left_dim = self.parse_dimension_expr(left, errors)?;
+                let right_dim = self.parse_dimension_expr(right, errors)?;
+
+                match op {
+                    Operator::Add => Some(self.heap.mk_size(SizeExpr::add(left_dim, right_dim))),
+                    Operator::Sub => Some(self.heap.mk_size(SizeExpr::sub(left_dim, right_dim))),
+                    Operator::Mult => Some(self.heap.mk_size(SizeExpr::mul(left_dim, right_dim))),
+                    Operator::FloorDiv => {
+                        Some(self.heap.mk_size(SizeExpr::floor_div(left_dim, right_dim)))
+                    }
+                    _ => {
+                        self.error(
+                            errors,
+                            expr.range(),
+                            ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                            format!(
+                                "Unsupported operator `{}` in tensor shape dimension",
+                                op.as_str()
+                            ),
+                        );
+                        None
+                    }
+                }
+            }
+            // Anything else is an error
+            _ => {
+                let expr_type = self.expr_infer(expr, errors);
+                self.error(
+                    errors,
+                    expr.range(),
+                    ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                    format!(
+                        "Tensor shape dimensions must be positive integer literals, string literals, type variables, or expressions, got `{}`",
+                        self.for_display(expr_type)
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Parse a list of dimension expressions, simplifying and validating each one.
+    /// Returns None if any dimension fails to parse or is non-positive.
+    fn parse_dimension_list(&self, args: &[Expr], errors: &ErrorCollector) -> Option<Vec<Type>> {
+        let mut dims = Vec::new();
+        for arg in args {
+            if let Some(dim) = self.parse_dimension_expr(arg, errors) {
+                let simplified = simplify(dim);
+
+                // Validate that literal dimensions are positive
+                if let Type::Size(SizeExpr::Literal(value)) = &simplified
+                    && value <= &0
+                {
+                    self.error(
+                        errors,
+                        arg.range(),
+                        ErrorInfo::Kind(ErrorKind::InvalidAnnotation),
+                        format!("Tensor shape dimension must be positive, got {}", value),
+                    );
+                    return None;
+                }
+
+                dims.push(simplified);
+            } else {
+                return None;
+            }
+        }
+        Some(dims)
+    }
+
+    /// Parse Dim[3], Dim[N], Dim[N+1] into Type::Dim(...)
+    fn parse_symint_type(
+        &self,
+        args: &[ruff_python_ast::Expr],
+        range: ruff_text_size::TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        // Dim takes exactly one argument
+        if args.len() != 1 {
+            self.error(
+                errors,
+                range,
+                ErrorInfo::Kind(ErrorKind::BadSpecialization),
+                format!("Expected 1 type argument for `Dim`, got {}", args.len()),
+            );
+            return Type::any_error();
+        }
+
+        // Parse, simplify, and validate the dimension
+        let Some(dims) = self.parse_dimension_list(args, errors) else {
+            return Type::any_error();
+        };
+
+        // Wrap in Type::Dim(...)
+        self.heap
+            .mk_type_form(self.heap.mk_dim(dims.into_iter().next().unwrap()))
     }
 
     /// Return the reason why we think `ty` is suspicious to use as a branching condition

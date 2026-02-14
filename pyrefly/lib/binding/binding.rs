@@ -391,7 +391,7 @@ impl AnyExportedKey {
 pub trait Keyed: Hash + Eq + Clone + DisplayWith<ModuleInfo> + Debug + Ranged + 'static {
     const EXPORTED: bool = false;
     type Value: Debug + DisplayWith<Bindings>;
-    type Answer: Clone + Debug + Display + TypeEq + VisitMut<Type>;
+    type Answer: Clone + Debug + Display + TypeEq + VisitMut<Type> + Send + Sync;
     fn to_anyidx(idx: Idx<Self>) -> AnyIdx;
 
     /// Convert this key to an AnyExportedKey if it is an exported key.

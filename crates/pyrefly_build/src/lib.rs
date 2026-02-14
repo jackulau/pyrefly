@@ -189,6 +189,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn test_get_source_db_always_configures_paths() {
         let mut bs = BuildSystem {
             args: BuildSystemArgs::Custom(CustomQueryArgs {

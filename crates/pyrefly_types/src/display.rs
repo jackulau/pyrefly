@@ -26,6 +26,7 @@ use starlark_map::smallmap;
 use crate::callable::Function;
 use crate::class::Class;
 use crate::literal::Lit;
+use crate::quantified::Quantified;
 use crate::stdlib::Stdlib;
 use crate::tuple::Tuple;
 use crate::type_alias::TypeAliasData;
@@ -42,7 +43,6 @@ use crate::types::Forallable;
 use crate::types::NeverStyle;
 use crate::types::SuperObj;
 use crate::types::TArgs;
-use crate::types::TParam;
 use crate::types::Type;
 use crate::types::Union;
 
@@ -100,6 +100,11 @@ pub enum LspDisplayMode {
     Hover,
     /// Signature help mode: Single-line for LSP compatibility
     SignatureHelp,
+    /// Query mode: Used by programmatic consumers (e.g. type query endpoints).
+    /// Formats types with explicit wrappers (e.g. BoundMethod[...]) so that
+    /// consumers can unambiguously parse the type without relying on parameter
+    /// name heuristics.
+    Query,
 }
 
 #[derive(Debug, Default)]
@@ -195,8 +200,8 @@ impl<'a> TypeDisplayContext<'a> {
         Fmt(|f| self.fmt_helper(t, f, false))
     }
 
-    fn fmt_targ(&self, param: &TParam, arg: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if param.quantified.is_type_var_tuple()
+    fn fmt_targ(&self, param: &Quantified, arg: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if param.is_type_var_tuple()
             && let Type::Tuple(tuple) = arg
         {
             match tuple {
@@ -353,6 +358,17 @@ impl<'a> TypeDisplayContext<'a> {
                 output.write_type(&class_type.targs().as_slice()[0])?;
                 output.write_str(", ...]")
             }
+            // Display Dim[Unknown] as just "Dim" for cleaner output
+            Type::ClassType(class_type)
+                if class_type.qname().id().as_str() == "Dim"
+                    && class_type.targs().as_slice().len() == 1
+                    && matches!(
+                        class_type.targs().as_slice()[0],
+                        Type::Any(AnyStyle::Implicit | AnyStyle::Error)
+                    ) =>
+            {
+                output.write_qname(class_type.qname())
+            }
             Type::ClassType(class_type) => {
                 output.write_qname(class_type.qname())?;
                 output.write_targs(class_type.targs())
@@ -389,6 +405,19 @@ impl<'a> TypeDisplayContext<'a> {
                     output.write_str("]")
                 }
             },
+            Type::Size(dim) => {
+                // Display dimension value directly without Literal wrapper
+                output.write_str(&format!("{}", dim))
+            }
+            Type::Dim(inner) => {
+                // Display Dim[Unknown] as just "Dim" for cleaner output
+                // (Unknown represents implicit Any from gradual typing)
+                // But keep Dim[Any] when explicitly annotated
+                match &**inner {
+                    Type::Any(AnyStyle::Implicit | AnyStyle::Error) => output.write_str("Dim"),
+                    _ => output.write_str(&format!("Dim[{}]", self.display_internal(inner))),
+                }
+            }
             Type::TypeVar(t) => {
                 let type_var_qname = self.stdlib.map(|s| s.type_var().qname());
                 output.write_builtin("TypeVar", type_var_qname)?;
@@ -503,8 +532,15 @@ impl<'a> TypeDisplayContext<'a> {
                 x.fmt_with_type(output, &|t, o| self.fmt_helper_generic(t, false, o))?;
                 output.write_str("]")
             }
-            Type::BoundMethod(box BoundMethod { obj: _, func }) => {
+            Type::BoundMethod(box BoundMethod { obj, func }) => {
                 match self.lsp_display_mode {
+                    LspDisplayMode::Query => {
+                        output.write_str("BoundMethod[")?;
+                        self.fmt_helper_generic(obj, false, output)?;
+                        output.write_str(", ")?;
+                        self.fmt_helper_generic(&func.clone().as_type(), is_toplevel, output)?;
+                        output.write_str("]")
+                    }
                     LspDisplayMode::Hover | LspDisplayMode::SignatureHelp if is_toplevel => {
                         match func {
                             BoundMethodType::Function(Function {
@@ -526,7 +562,7 @@ impl<'a> TypeDisplayContext<'a> {
                                             self.fmt_helper_generic(t, false, o)
                                         })?;
                                     }
-                                    LspDisplayMode::Standard => unreachable!(),
+                                    _ => unreachable!(),
                                 }
                                 output.write_str(": ...")
                             }
@@ -542,7 +578,11 @@ impl<'a> TypeDisplayContext<'a> {
                                 output.write_str("def ")?;
                                 output.write_str(func_name.as_ref().as_str())?;
                                 output.write_str("[")?;
-                                write!(output, "{}", commas_iter(|| tparams.iter()))?;
+                                write!(
+                                    output,
+                                    "{}",
+                                    commas_iter(|| tparams.iter().map(|q| q.display_with_bounds()))
+                                )?;
                                 output.write_str("]")?;
                                 match self.lsp_display_mode {
                                     LspDisplayMode::Hover => {
@@ -556,7 +596,7 @@ impl<'a> TypeDisplayContext<'a> {
                                             self.fmt_helper_generic(t, false, o)
                                         })?;
                                     }
-                                    LspDisplayMode::Standard => unreachable!(),
+                                    _ => unreachable!(),
                                 }
                                 output.write_str(": ...")
                             }
@@ -713,14 +753,22 @@ impl<'a> TypeDisplayContext<'a> {
             }) => {
                 if self.lsp_display_mode == LspDisplayMode::Hover && is_toplevel {
                     output.write_str("[")?;
-                    write!(output, "{}", commas_iter(|| tparams.iter()))?;
+                    write!(
+                        output,
+                        "{}",
+                        commas_iter(|| tparams.iter().map(|q| q.display_with_bounds()))
+                    )?;
                     output.write_str("]")?;
                     c.fmt_with_type_with_newlines(output, &|t, o| {
                         self.fmt_helper_generic(t, false, o)
                     })
                 } else {
                     output.write_str("[")?;
-                    write!(output, "{}", commas_iter(|| tparams.iter()))?;
+                    write!(
+                        output,
+                        "{}",
+                        commas_iter(|| tparams.iter().map(|q| q.display_with_bounds()))
+                    )?;
                     output.write_str("]")?;
                     self.fmt_helper_generic(&body.clone().as_type(), false, output)
                 }
@@ -739,7 +787,11 @@ impl<'a> TypeDisplayContext<'a> {
                     output.write_str("def ")?;
                     output.write_str(func_name.as_ref().as_str())?;
                     output.write_str("[")?;
-                    write!(output, "{}", commas_iter(|| tparams.iter()))?;
+                    write!(
+                        output,
+                        "{}",
+                        commas_iter(|| tparams.iter().map(|q| q.display_with_bounds()))
+                    )?;
                     output.write_str("]")?;
                     match self.lsp_display_mode {
                         LspDisplayMode::Hover => {
@@ -758,7 +810,11 @@ impl<'a> TypeDisplayContext<'a> {
                 }
                 _ => {
                     output.write_str("[")?;
-                    write!(output, "{}", commas_iter(|| tparams.iter()))?;
+                    write!(
+                        output,
+                        "{}",
+                        commas_iter(|| tparams.iter().map(|q| q.display_with_bounds()))
+                    )?;
                     output.write_str("]")?;
                     self.fmt_helper_generic(&body.clone().as_type(), false, output)
                 }
@@ -1054,7 +1110,6 @@ pub mod tests {
     use crate::types::BoundMethodType;
     use crate::types::Overload;
     use crate::types::OverloadType;
-    use crate::types::TParam;
     use crate::types::TParams;
 
     pub fn fake_class(name: &str, module: &str, range: u32) -> Class {
@@ -1074,21 +1129,19 @@ pub mod tests {
         )
     }
 
-    pub fn fake_tparams(tparams: Vec<TParam>) -> Arc<TParams> {
+    pub fn fake_tparams(tparams: Vec<Quantified>) -> Arc<TParams> {
         Arc::new(TParams::new(tparams))
     }
 
-    fn fake_tparam(uniques: &UniqueFactory, name: &str, kind: QuantifiedKind) -> TParam {
-        TParam {
-            quantified: Quantified::new(
-                uniques.fresh(),
-                Name::new(name),
-                kind,
-                None,
-                Restriction::Unrestricted,
-                PreInferenceVariance::Invariant,
-            ),
-        }
+    fn fake_tparam(uniques: &UniqueFactory, name: &str, kind: QuantifiedKind) -> Quantified {
+        Quantified::new(
+            uniques.fresh(),
+            Name::new(name),
+            kind,
+            None,
+            Restriction::Unrestricted,
+            PreInferenceVariance::Invariant,
+        )
     }
 
     fn fake_tyvar(name: &str, module: &str, range: u32) -> TypeVar {
@@ -1714,6 +1767,11 @@ pub mod tests {
     y: Any
 ) -> None: ..."#
         );
+        ctx.set_lsp_display_mode(LspDisplayMode::Query);
+        assert_eq!(
+            ctx.display(&bound_method).to_string(),
+            "BoundMethod[type[MyClass], (self: Any, x: Any, y: Any) -> None]"
+        );
     }
 
     #[test]
@@ -1738,6 +1796,11 @@ pub mod tests {
     x: Any,
     y: Any
 ) -> None: ..."#
+        );
+        ctx.set_lsp_display_mode(LspDisplayMode::Query);
+        assert_eq!(
+            ctx.display(&bound_method).to_string(),
+            "BoundMethod[type[MyClass], [T](self: Any, x: Any, y: Any) -> None]"
         );
     }
 

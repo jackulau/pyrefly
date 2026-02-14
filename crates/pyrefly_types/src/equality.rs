@@ -301,7 +301,6 @@ mod tests {
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
     use crate::types::Forallable;
-    use crate::types::TParam;
     use crate::types::TParams;
     use crate::types::Type;
 
@@ -398,9 +397,7 @@ mod tests {
                 PreInferenceVariance::Invariant,
             );
 
-            let tparams = TParams::new(vec![TParam {
-                quantified: q.clone(),
-            }]);
+            let tparams = TParams::new(vec![q.clone()]);
 
             Forallable::Function(Function {
                 signature: Callable::list(ParamList::everything(), q.clone().to_type(heap)),

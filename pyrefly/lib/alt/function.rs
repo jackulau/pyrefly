@@ -20,7 +20,6 @@ use pyrefly_types::class::Class;
 use pyrefly_types::class::ClassType;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::types::BoundMethod;
-use pyrefly_types::types::TParam;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::TParamsSource;
 use pyrefly_types::types::Union;
@@ -1110,7 +1109,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if ret_tparams.is_empty() {
             (tparams, signature)
         } else {
-            let make_tparams = |tparams: Vec<&TParam>| {
+            let make_tparams = |tparams: Vec<&Quantified>| {
                 Arc::new(TParams::new(tparams.into_iter().cloned().collect()))
             };
             // Recursively move type parameters in the return type so that
@@ -1128,14 +1127,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         tparams: &'b TParams,
         params: &Params,
-    ) -> (Vec<&'b TParam>, Vec<&'b TParam>) {
+    ) -> (Vec<&'b Quantified>, Vec<&'b Quantified>) {
         let mut param_qs = SmallSet::new();
         params.visit(&mut |ty| {
             ty.collect_quantifieds(&mut param_qs);
         });
-        tparams
-            .iter()
-            .partition(|tparam| param_qs.contains(&tparam.quantified))
+        tparams.iter().partition(|tparam| param_qs.contains(tparam))
     }
 
     /// Turn any top-level Type::Callable(callable) in `ret` into Forall[tparams, callable].
@@ -1233,12 +1230,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if let Some(tparams) = tparams_opt {
             // Identify which original tparams are actually used in the result
             // We scope this in a block to drop the borrow on inferred_ty immediately after scanning
-            let relevant_tparams_vec: Vec<TParam> = {
+            let relevant_tparams_vec: Vec<Quantified> = {
                 let mut used_quantifieds = SmallSet::new();
                 inferred_ty.collect_quantifieds(&mut used_quantifieds);
                 tparams
                     .iter()
-                    .filter(|p| used_quantifieds.contains(&p.quantified))
+                    .filter(|p| used_quantifieds.contains(p))
                     .cloned()
                     .collect()
             };
@@ -1258,7 +1255,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     ty => {
                         let substitution_map: SmallMap<_, _> = new_tparams
                             .iter()
-                            .map(|p| (&p.quantified, p.quantified.as_gradual_type()))
+                            .map(|p| (p, p.as_gradual_type()))
                             .collect();
                         ty.subst(&substitution_map.iter().map(|(k, v)| (*k, v)).collect())
                     }
@@ -1455,12 +1452,9 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     }
 
     fn subst_function(&self, tparams: &TParams, func: Function) -> Function {
-        let mp = tparams.as_vec().map(|p| {
-            (
-                &p.quantified,
-                p.restriction().as_type(self.stdlib, self.heap),
-            )
-        });
+        let mp = tparams
+            .as_vec()
+            .map(|p| (p, p.restriction().as_type(self.stdlib, self.heap)));
         match self
             .heap
             .mk_function(func)
@@ -1691,31 +1685,53 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         m: &BoundMethod,
         is_subset: &mut dyn FnMut(&Type, &Type) -> bool,
     ) -> Option<Type> {
-        self.bind_function(&m.func.clone().as_type(), &m.obj, is_subset)
+        self.bind_function(&m.func.clone().as_type(), &m.obj, false, is_subset)
     }
 
     pub fn bind_dunder_new(&self, t: &Type, cls: ClassType) -> Option<Type> {
         self.bind_function(
             t,
             &self.heap.mk_type_form(self.heap.mk_self_type(cls)),
+            false,
             &mut |a, b| self.is_subset_eq(a, b),
         )
     }
 
+    /// Bind a `__init__` method for constructor callable conversion.
+    /// Strips the first parameter and sets the return type to the first param's type.
+    /// Does not instantiate type variables (they should be inferred at the call site).
+    pub fn bind_dunder_init_for_callable(&self, m: &BoundMethod) -> Option<Type> {
+        let mut func_type = m.func.clone().as_type();
+        // For each callable, set its return type to its first param's type (i.e. `self`).
+        func_type.visit_toplevel_callable_mut(&mut |c: &mut Callable| {
+            if let Some(self_type) = c.get_first_param() {
+                c.ret = self_type;
+            }
+        });
+        self.bind_function(&func_type, &m.obj, true, &mut |_, _| false)
+    }
+
     /// If this is an unbound callable (i.e., a callable that is not BoundMethod), strip the first parameter.
     /// If it is generic, we use the bound object to instantiate type variables in the first argument.
+    ///
+    /// If `skip_instantiation` is true, skip type variable instantiation (used for converting
+    /// constructors to callables, where type variables should be inferred at the call site).
     fn bind_function(
         &self,
         t: &Type,
         obj: &Type,
+        skip_instantiation: bool,
         is_subset: &mut dyn FnMut(&Type, &Type) -> bool,
     ) -> Option<Type> {
         let mut owner = Owner::new();
         match t {
             Type::Forall(forall) => match &forall.body {
                 Forallable::Callable(c) => c.split_first_param(&mut owner).map(|(param, c)| {
-                    let c =
-                        self.instantiate_callable_self(&forall.tparams, obj, param, c, is_subset);
+                    let c = if skip_instantiation {
+                        c
+                    } else {
+                        self.instantiate_callable_self(&forall.tparams, obj, param, c, is_subset)
+                    };
                     self.heap.mk_forall(Forall {
                         tparams: forall.tparams.clone(),
                         body: Forallable::Callable(c),
@@ -1723,13 +1739,17 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 }),
                 Forallable::Function(f) => {
                     f.signature.split_first_param(&mut owner).map(|(param, c)| {
-                        let c = self.instantiate_callable_self(
-                            &forall.tparams,
-                            obj,
-                            param,
-                            c,
-                            is_subset,
-                        );
+                        let c = if skip_instantiation {
+                            c
+                        } else {
+                            self.instantiate_callable_self(
+                                &forall.tparams,
+                                obj,
+                                param,
+                                c,
+                                is_subset,
+                            )
+                        };
                         self.heap.mk_forall(Forall {
                             tparams: forall.tparams.clone(),
                             body: Forallable::Function(Function {
@@ -1768,13 +1788,17 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         .signature
                         .split_first_param(&mut owner)
                         .map(|(param, c)| {
-                            let c = self.instantiate_callable_self(
-                                &forall.tparams,
-                                obj,
-                                param,
-                                c,
-                                is_subset,
-                            );
+                            let c = if skip_instantiation {
+                                c
+                            } else {
+                                self.instantiate_callable_self(
+                                    &forall.tparams,
+                                    obj,
+                                    param,
+                                    c,
+                                    is_subset,
+                                )
+                            };
                             OverloadType::Forall(Forall {
                                 tparams: forall.tparams.clone(),
                                 body: Function {
@@ -1829,12 +1853,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             && let Type::ClassType(cls_ty) = self_ty
             && cls_ty.name() == cls_name
         {
-            let tparams_names = cls_ty
-                .tparams()
-                .as_vec()
-                .iter()
-                .map(|tp| &tp.quantified)
-                .collect::<SmallSet<_>>();
+            let tparams_names = cls_ty.tparams().iter().collect::<SmallSet<_>>();
             let mut class_scoped_tvars = SmallSet::new();
             for (_, ty) in cls_ty.targs().iter_paired() {
                 ty.collect_quantifieds(&mut class_scoped_tvars);

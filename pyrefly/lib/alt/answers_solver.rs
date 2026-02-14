@@ -5,10 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 
 use dupe::Dupe;
 use dupe::IterDupedExt;
-use itertools::Either;
+use fxhash::FxHashMap;
 use itertools::Itertools;
 use pyrefly_graph::calculation::Calculation;
 use pyrefly_graph::calculation::ProposalResult;
@@ -33,6 +34,7 @@ use pyrefly_types::types::Union;
 use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::recurser::Guard;
 use pyrefly_util::uniques::UniqueFactory;
+use pyrefly_util::visit::VisitMut;
 use ruff_text_size::TextRange;
 use starlark_map::Hashed;
 use starlark_map::small_set::SmallSet;
@@ -58,6 +60,7 @@ use crate::binding::table::TableKeyed;
 use crate::config::base::RecursionLimitConfig;
 use crate::config::base::RecursionOverflowHandler;
 use crate::config::error_kind::ErrorKind;
+use crate::dispatch_anyidx;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::ErrorInfo;
 use crate::error::context::TypeCheckContext;
@@ -155,7 +158,10 @@ pub struct CalcStack {
     stack: RefCell<Vec<CalcId>>,
     scc_stack: RefCell<Vec<Scc>>,
     /// Reverse lookup of `stack`, to enable O(1) access for a given CalcId.
-    position_of: RefCell<HashMap<CalcId, Vec1<usize>>>,
+    position_of: RefCell<FxHashMap<CalcId, Vec1<usize>>>,
+    /// SCCs that completed during `on_calculation_finished` but haven't been
+    /// batch-committed yet. Drained by `get_idx` after each frame completes.
+    pending_completed_sccs: RefCell<Vec<Scc>>,
 }
 
 impl CalcStack {
@@ -163,8 +169,42 @@ impl CalcStack {
         Self {
             stack: RefCell::new(Vec::new()),
             scc_stack: RefCell::new(Vec::new()),
-            position_of: RefCell::new(HashMap::new()),
+            position_of: RefCell::new(FxHashMap::default()),
+            pending_completed_sccs: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Pop the current frame and drain any SCCs that completed during it.
+    ///
+    /// These two operations are always paired: every `pop` must be followed by
+    /// draining and committing completed SCCs.
+    ///
+    /// We pop before draining (not after) for two reasons:
+    /// - Lifecycle correctness: committed answers should correspond to fully
+    ///   unwound computations. Popping first ensures the stack no longer
+    ///   contains the completing frame when results are written to Calculation.
+    /// - `pop()` decrements `segment_size` on the top SCC. If we drained first,
+    ///   the completed SCC would already be gone from `scc_stack`, and `pop()`
+    ///   could incorrectly decrement a parent SCC's segment_size instead.
+    ///
+    /// Note that the `+ 1` in `on_calculation_finished`'s completion check
+    /// (`stack_len <= anchor_pos + 1`) is unrelated to this ordering — it
+    /// exists because completion is detected during calculation, while the
+    /// frame is still on the stack, well before we reach this method.
+    ///
+    /// Safety: `drain_completed_sccs` uses `std::mem::take` which drops the
+    /// `RefCell` borrow before returning the owned `Vec<Scc>`. By the time the
+    /// caller iterates the returned SCCs, no borrow on `self` is live.
+    fn pop_and_drain_completed_sccs(&self) -> Vec<Scc> {
+        self.pop();
+        self.drain_completed_sccs()
+    }
+
+    /// Drain and return all completed SCCs that were collected during
+    /// `on_calculation_finished`. Used by `pop_and_drain_completed_sccs`
+    /// to batch-commit answers after a frame completes.
+    fn drain_completed_sccs(&self) -> Vec<Scc> {
+        std::mem::take(&mut *self.pending_completed_sccs.borrow_mut())
     }
 
     /// Push a CalcId onto the stack and compute the binding action.
@@ -173,11 +213,7 @@ impl CalcStack {
     /// performing all SCC state checks and mutations (like `on_scc_detected`,
     /// `on_calculation_finished`). SCC merging (`merge_sccs`) is handled
     /// inside `pre_calculate_state` when a node is found in a previous SCC.
-    fn push<T, R>(&self, current: CalcId, calculation: &Calculation<T, R>) -> BindingAction<T, R>
-    where
-        T: Dupe,
-        R: Dupe,
-    {
+    fn push<T: Dupe>(&self, current: CalcId, calculation: &Calculation<T>) -> BindingAction<T> {
         let position = {
             let mut stack = self.stack.borrow_mut();
             let pos = stack.len();
@@ -190,10 +226,9 @@ impl CalcStack {
             .and_modify(|positions| positions.push(position))
             .or_insert_with(|| Vec1::new(position));
         match self.pre_calculate_state(&current) {
-            SccState::NotInScc | SccState::RevisitingInProgress | SccState::RevisitingDone => {
+            SccState::NotInScc | SccState::RevisitingInProgress => {
                 match calculation.propose_calculation() {
                     ProposalResult::Calculated(v) => BindingAction::Calculated(v),
-                    ProposalResult::CycleBroken(r) => BindingAction::CycleBroken(r),
                     ProposalResult::CycleDetected => {
                         let current_cycle = self.current_cycle().unwrap();
                         match self.on_scc_detected(current_cycle) {
@@ -204,14 +239,37 @@ impl CalcStack {
                     ProposalResult::Calculatable => BindingAction::Calculate,
                 }
             }
-            SccState::BreakAt => BindingAction::Unwind,
-            SccState::HasPlaceholder => match calculation.propose_calculation() {
-                ProposalResult::CycleBroken(r) => BindingAction::CycleBroken(r),
-                ProposalResult::Calculated(v) => BindingAction::Calculated(v),
-                ProposalResult::CycleDetected | ProposalResult::Calculatable => {
-                    unreachable!("HasPlaceholder node must have CycleBroken or Calculated result")
+            SccState::RevisitingDone => {
+                // Try to read from the SCC-local NodeState::Done first.
+                // If the answer is available, return it without touching Calculation.
+                if let Some(answer) = self.get_scc_done_answer(&current) {
+                    BindingAction::SccLocalAnswer(answer)
+                } else {
+                    // Fallback: answer is None (another path computed it).
+                    // Check if another thread already committed a final answer.
+                    match calculation.get() {
+                        Some(v) => BindingAction::Calculated(v),
+                        None => unreachable!(
+                            "RevisitingDone node has no SCC-local answer and no global answer"
+                        ),
+                    }
                 }
-            },
+            }
+            SccState::BreakAt => BindingAction::Unwind,
+            SccState::HasPlaceholder => {
+                // Read placeholder from SCC-local NodeState::HasPlaceholder.
+                // No need to touch the Calculation cell — placeholders are never
+                // stored there.
+                if let Some(v) = calculation.get() {
+                    // Another thread already committed a final answer.
+                    BindingAction::Calculated(v)
+                } else {
+                    let var = self
+                        .get_scc_placeholder_var(&current)
+                        .expect("HasPlaceholder state but no placeholder in NodeState");
+                    BindingAction::CycleBroken(var)
+                }
+            }
             SccState::Participant => {
                 if let Some(top_scc) = self.scc_stack.borrow_mut().last_mut() {
                     top_scc.segment_size += 1;
@@ -224,12 +282,9 @@ impl CalcStack {
                     }
                     ProposalResult::CycleDetected => BindingAction::Calculate,
                     ProposalResult::Calculated(v) => {
-                        self.on_calculation_finished(&current);
+                        // Participant already computed: no data to store.
+                        self.on_calculation_finished(&current, None, None);
                         BindingAction::Calculated(v)
-                    }
-                    ProposalResult::CycleBroken(r) => {
-                        self.on_calculation_finished(&current);
-                        BindingAction::CycleBroken(r)
                     }
                 }
             }
@@ -269,6 +324,41 @@ impl CalcStack {
             .borrow()
             .get(calc_id)
             .map(|positions| *positions.first())
+    }
+
+    /// Check if a CalcId is an SCC participant (exists in the top SCC's node_state).
+    fn is_scc_participant(&self, current: &CalcId) -> bool {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .is_some_and(|top_scc| top_scc.node_state.contains_key(current))
+    }
+
+    /// Retrieve the placeholder Var from NodeState::HasPlaceholder in the top SCC.
+    /// Returns `Some(var)` if the node is a break_at node with a placeholder,
+    /// `None` otherwise. Used during calculate_and_record_answer to determine
+    /// whether finalize_recursive_answer needs to be called.
+    fn get_scc_placeholder_var(&self, current: &CalcId) -> Option<Var> {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .and_then(|top_scc| match top_scc.node_state.get(current)? {
+                NodeState::HasPlaceholder(var) => Some(*var),
+                _ => None,
+            })
+    }
+
+    /// Retrieve the type-erased answer from NodeState::Done in the top SCC.
+    /// Returns `Some(answer)` if the node is Done with data, `None` otherwise
+    /// (node not in SCC, not Done, or Done with answer: None).
+    fn get_scc_done_answer(&self, current: &CalcId) -> Option<Arc<dyn Any + Send + Sync>> {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .and_then(|top_scc| match top_scc.node_state.get(current)? {
+                NodeState::Done { answer, .. } => answer.clone(),
+                _ => None,
+            })
     }
 
     /// Push a CalcId onto the stack without computing the binding action, for tests
@@ -493,37 +583,73 @@ impl CalcStack {
         }
     }
 
-    /// Handle the completion of a calculation. This might involve progress on
-    /// the remaining participants of one or more SCCs.
+    /// Handle the completion of a calculation. Mark the node as Done in the
+    /// top SCC (if it's a participant), then push any completed SCCs to the
+    /// `pending_completed_sccs` buffer for later batch-commit by `get_idx`.
     ///
-    /// Return `true` if there are active SCCs after finishing this calculation,
-    /// `false` if there are not.
-    fn on_calculation_finished(&self, current: &CalcId) -> bool {
+    /// Only the top SCC is checked because each node appears in at most one
+    /// SCC, and active calculations are always in the top SCC.
+    fn on_calculation_finished(
+        &self,
+        current: &CalcId,
+        answer: Option<Arc<dyn Any + Send + Sync>>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
         let stack_len = self.stack.borrow().len();
         let mut scc_stack = self.scc_stack.borrow_mut();
-        for scc in scc_stack.iter_mut() {
-            scc.on_calculation_finished(current);
-        }
+        let canonical = if let Some(top_scc) = scc_stack.last_mut() {
+            let canonical = top_scc.on_calculation_finished(current, answer, errors);
+            // Debug-only check: verify the node isn't in any other SCC.
+            debug_assert!(
+                scc_stack
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .all(|scc| !scc.node_state.contains_key(current)),
+                "on_calculation_finished: CalcId {} found in multiple SCCs",
+                current,
+            );
+            canonical
+        } else {
+            // No active SCC; return the provided answer unchanged.
+            answer
+        };
         // Pop all SCCs whose anchor position indicates completion.
         // An SCC is complete when the stack has unwound to (or past) its
         // anchor: at that point all participants' frames have been popped
-        // and their answers recorded.
+        // and their answers recorded. Push them to the pending buffer
+        // so that `get_idx` can batch-commit them after the frame completes.
         while let Some(scc) = scc_stack.last() {
             if stack_len <= scc.anchor_pos + 1 {
-                scc_stack.pop();
+                self.pending_completed_sccs
+                    .borrow_mut()
+                    .push(scc_stack.pop().unwrap());
             } else {
                 break;
             }
         }
-        // Do we still have active SCCs?
-        !scc_stack.is_empty()
+        canonical
     }
 
     /// Track that a placeholder has been recorded for a break_at node.
-    fn on_placeholder_recorded(&self, current: &CalcId) {
+    ///
+    /// Only the top SCC is checked because each node appears in at most one
+    /// SCC, and placeholder recording happens during active cycle breaking
+    /// in the top SCC.
+    fn on_placeholder_recorded(&self, current: &CalcId, var: Var) {
         let mut scc_stack = self.scc_stack.borrow_mut();
-        for scc in scc_stack.iter_mut() {
-            scc.on_placeholder_recorded(current);
+        if let Some(top_scc) = scc_stack.last_mut() {
+            top_scc.on_placeholder_recorded(current, var);
+            // Debug-only check: verify the node isn't in any other SCC.
+            debug_assert!(
+                scc_stack
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .all(|scc| !scc.node_state.contains_key(current)),
+                "on_placeholder_recorded: CalcId {} found in multiple SCCs",
+                current,
+            );
         }
     }
 
@@ -569,13 +695,14 @@ impl CalcStack {
             .expect("Target SCC not found during merge - this indicates a bug in SCC tracking");
 
         // Perform the merge, then add any free-floating bindings that weren't previously part
-        // of a known SCC.
+        // of a known SCC. These nodes are already on the call stack (they have active frames),
+        // so they are InProgress, not Fresh.
         let mut merged = Scc::merge_many(sccs_to_merge, detected_at_of_scc.dupe());
         for calc_id in calc_stack_vec.iter().skip(min_depth) {
             merged
                 .node_state
                 .entry(calc_id.dupe())
-                .or_insert(NodeState::Fresh);
+                .or_insert(NodeState::InProgress);
         }
 
         // After a merge, everything from the merged anchor to the current stack top
@@ -594,19 +721,46 @@ impl CalcStack {
 /// - InProgress → HasPlaceholder (when this is a break_at node and we record a placeholder)
 /// - InProgress/HasPlaceholder → Done (when the node's calculation completes)
 ///
-/// The variants are ordered by "advancement" (Fresh < InProgress < HasPlaceholder < Done)
-/// so that when merging SCCs we can use `max()` to keep the more advanced state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// The variants are ordered by "advancement" (Fresh < InProgress < HasPlaceholder < Done).
+/// The `advancement_rank()` method encodes this ordering for use during SCC merge.
+#[derive(Debug, Clone)]
 enum NodeState {
     /// Node hasn't been processed yet as part of SCC handling.
     Fresh,
     /// Node is currently being processed (on the Rust call stack).
     InProgress,
-    /// This is a break_at node: we've recorded a placeholder in Calculation
+    /// This is a break_at node: we've recorded a placeholder in SCC-local state
     /// but haven't computed the real answer yet.
-    HasPlaceholder,
-    /// Node's calculation has completed.
-    Done,
+    /// The Var is the placeholder variable recorded for this break_at node.
+    HasPlaceholder(Var),
+    /// Node's calculation has completed. Stores the type-erased answer and
+    /// error collector for thread-local SCC isolation.
+    ///
+    /// For SCC participants, the answer is stored here until the entire SCC
+    /// completes, at which point batch_commit_scc writes all answers to
+    /// their respective Calculation cells.
+    ///
+    /// The data is `None` when the node was already computed by another
+    /// path (e.g. a Participant revisit) and only the state transition
+    /// to Done matters.
+    Done {
+        answer: Option<Arc<dyn Any + Send + Sync>>,
+        errors: Option<Arc<ErrorCollector>>,
+    },
+}
+
+impl NodeState {
+    /// Returns a numeric rank for the advancement level of this state.
+    /// Used during SCC merge to keep the more advanced state.
+    /// Fresh(0) < InProgress(1) < HasPlaceholder(2) < Done(3)
+    fn advancement_rank(&self) -> u8 {
+        match self {
+            NodeState::Fresh => 0,
+            NodeState::InProgress => 1,
+            NodeState::HasPlaceholder(_) => 2,
+            NodeState::Done { .. } => 3,
+        }
+    }
 }
 
 /// Represents the current SCC state prior to attempting a particular calculation.
@@ -664,7 +818,7 @@ enum SccDetectedResult {
 /// discriminated union. The `CalcStack::push` method performs all state checks and
 /// SCC mutations (like `merge_sccs`, `on_scc_detected`, `on_calculation_finished`),
 /// returning the action that `get_idx` should take.
-enum BindingAction<T, R> {
+enum BindingAction<T> {
     /// Calculate the binding and record the answer.
     /// Action: call `calculate_and_record_answer`
     Calculate,
@@ -674,9 +828,14 @@ enum BindingAction<T, R> {
     /// A final answer is already available.
     /// Action: return `v`
     Calculated(T),
-    /// A recursive placeholder exists and we should return it.
+    /// A recursive placeholder exists (in SCC-local `NodeState::HasPlaceholder`)
+    /// and we should return it.
     /// Action: return `Arc::new(K::promote_recursive(heap, r))`
-    CycleBroken(R),
+    CycleBroken(Var),
+    /// An answer is available from NodeState::Done in the top SCC.
+    /// Type-erased; will be downcast to `Arc<K::Answer>` in `get_idx`.
+    /// Action: downcast and return
+    SccLocalAnswer(Arc<dyn Any + Send + Sync>),
 }
 
 /// Represent an SCC (Strongly Connected Component) we are currently solving.
@@ -699,7 +858,7 @@ pub struct Scc {
     break_at: BTreeSet<CalcId>,
     /// State of each participant in this SCC.
     /// Keys are all participants; values track their computation state.
-    node_state: HashMap<CalcId, NodeState>,
+    node_state: BTreeMap<CalcId, NodeState>,
     /// Where we detected the SCC (for debugging only)
     detected_at: CalcId,
     /// Stack position of the SCC anchor (the position of the detected_at CalcId).
@@ -735,7 +894,7 @@ impl Scc {
         let (_, break_at) = raw.iter().enumerate().min_by_key(|(_, c)| *c).unwrap();
 
         // Initialize all nodes as Fresh
-        let node_state: HashMap<CalcId, NodeState> =
+        let node_state: BTreeMap<CalcId, NodeState> =
             raw.iter().duped().map(|c| (c, NodeState::Fresh)).collect();
 
         let mut break_at_set = BTreeSet::new();
@@ -773,6 +932,22 @@ impl Scc {
     /// When a Fresh node is encountered, it transitions to InProgress.
     fn pre_calculate_state(&mut self, current: &CalcId) -> SccState {
         if self.break_at.contains(current) {
+            // For break_at nodes that already have a placeholder or are Done,
+            // return the state-appropriate response. BreakAt (which triggers
+            // Unwind -> attempt_to_unwind_cycle_from_here -> on_placeholder_recorded)
+            // should only fire when the node is Fresh or InProgress, i.e. the
+            // break has not happened yet.
+            //
+            // Without this guard, revisiting a Done break_at node would cause
+            // on_placeholder_recorded to overwrite Done back to HasPlaceholder,
+            // losing the stored answer needed for batch commit.
+            if let Some(state) = self.node_state.get(current) {
+                match state {
+                    NodeState::HasPlaceholder(_) => return SccState::HasPlaceholder,
+                    NodeState::Done { .. } => return SccState::RevisitingDone,
+                    NodeState::Fresh | NodeState::InProgress => {}
+                }
+            }
             SccState::BreakAt
         } else if let Some(state) = self.node_state.get_mut(current) {
             match state {
@@ -785,11 +960,11 @@ impl Scc {
                     // via a different path. This will trigger new cycle detection.
                     SccState::RevisitingInProgress
                 }
-                NodeState::HasPlaceholder => {
+                NodeState::HasPlaceholder(_) => {
                     // Already has placeholder, return it
                     SccState::HasPlaceholder
                 }
-                NodeState::Done => {
+                NodeState::Done { .. } => {
                     // Node completed within this SCC - preliminary answer should exist.
                     SccState::RevisitingDone
                 }
@@ -800,16 +975,58 @@ impl Scc {
     }
 
     /// Track that a calculation has finished, marking it as Done.
-    fn on_calculation_finished(&mut self, current: &CalcId) {
+    /// Stores the type-erased answer and error collector in NodeState.
+    /// For SCC participants, this is the primary storage until batch commit.
+    ///
+    /// This method implements first-answer-wins semantics: once a node is marked
+    /// as Done, subsequent calculations (from duplicate stack frames within an SCC)
+    /// do not overwrite the state. This ensures that the first computed answer is
+    /// the one that persists, consistent with Calculation::record_value semantics.
+    ///
+    /// Returns the canonical answer: the one that is (or was already) stored in
+    /// NodeState::Done. If the node was already Done, returns the pre-existing
+    /// answer without overwriting. If the node was not yet Done, stores the
+    /// provided answer and returns a clone of it. If the node is not tracked
+    /// by this SCC at all, returns the provided answer unchanged.
+    ///
+    /// The data is `None` when the node was already computed by another
+    /// path and only the state transition matters.
+    fn on_calculation_finished(
+        &mut self,
+        current: &CalcId,
+        answer: Option<Arc<dyn Any + Send + Sync>>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
         if let Some(state) = self.node_state.get_mut(current) {
-            *state = NodeState::Done;
+            if let NodeState::Done {
+                answer: existing_answer,
+                ..
+            } = state
+            {
+                // Already Done: return the canonical (first-written) answer.
+                existing_answer.clone()
+            } else {
+                *state = NodeState::Done {
+                    answer: answer.clone(),
+                    errors,
+                };
+                answer
+            }
+        } else {
+            // Node not tracked by this SCC; return the provided answer as-is.
+            answer
         }
     }
 
     /// Track that a placeholder has been recorded for a break_at node.
-    fn on_placeholder_recorded(&mut self, current: &CalcId) {
+    fn on_placeholder_recorded(&mut self, current: &CalcId, var: Var) {
         if let Some(state) = self.node_state.get_mut(current) {
-            *state = NodeState::HasPlaceholder;
+            // Only upgrade: do not overwrite Done back to HasPlaceholder.
+            // This is defense-in-depth; pre_calculate_state should prevent
+            // this path from being reached for Done nodes.
+            if state.advancement_rank() < NodeState::HasPlaceholder(var).advancement_rank() {
+                *state = NodeState::HasPlaceholder(var);
+            }
         }
     }
 
@@ -828,7 +1045,11 @@ impl Scc {
         for (k, v) in other.node_state {
             self.node_state
                 .entry(k)
-                .and_modify(|existing| *existing = (*existing).max(v))
+                .and_modify(|existing| {
+                    if v.advancement_rank() > existing.advancement_rank() {
+                        *existing = v.clone();
+                    }
+                })
                 .or_insert(v);
         }
         // Keep the smallest detected_at for consistency/determinism
@@ -1006,25 +1227,39 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 .unwrap_or_else(|r| Arc::new(K::promote_recursive(self.heap, r))),
             BindingAction::Calculated(v) => v,
             BindingAction::CycleBroken(r) => Arc::new(K::promote_recursive(self.heap, r)),
+            BindingAction::SccLocalAnswer(type_erased) => {
+                // Downcast the type-erased answer back to Arc<K::Answer>.
+                // The answer was stored as Arc::new(answer.dupe()) where answer: Arc<K::Answer>,
+                // so the concrete type inside Arc<dyn Any> is Arc<K::Answer>.
+                // downcast() returns Arc<Arc<K::Answer>>; unwrap_or_clone extracts the inner Arc.
+                Arc::unwrap_or_clone(
+                    type_erased
+                        .downcast::<Arc<K::Answer>>()
+                        .expect("SccLocalAnswer downcast failed: type mismatch"),
+                )
+            }
         };
-        self.stack().pop();
+        for scc in self.stack().pop_and_drain_completed_sccs() {
+            self.batch_commit_scc(scc);
+        }
         result
     }
-    /// Calculate the answer for a binding using `K::solve` and record it in the table.
+    /// Calculate the answer for a binding using `K::solve` and record it.
     ///
     /// This is called when the `push` method determines we need to actually compute the value.
-    /// The calculation result is recorded via `Calculation::record_value`, which handles
-    /// concurrent computation correctly.
     ///
-    /// Errors are collected in a local error collector during solving. Only if we actually
-    /// write the result (i.e., no other thread beat us to it) do we propagate the errors to
-    /// the answer. This prevents duplicate errors when multiple threads compute
-    /// the same binding.
+    /// For SCC participants, the answer is stored in `NodeState::Done` and will be
+    /// batch-committed to the `Calculation` cell when the entire SCC completes.
+    /// For non-SCC nodes, the answer is written directly to `Calculation` as before.
+    ///
+    /// Completed SCCs are pushed to the `pending_completed_sccs` buffer
+    /// inside `on_calculation_finished`; `get_idx` drains them after the
+    /// frame completes.
     fn calculate_and_record_answer<K: Solve<Ans>>(
         &self,
         current: CalcId,
         idx: Idx<K>,
-        calculation: &Calculation<Arc<K::Answer>, Var>,
+        calculation: &Calculation<Arc<K::Answer>>,
     ) -> Arc<K::Answer>
     where
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
@@ -1036,25 +1271,153 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         // We use the range for error reporting.
         let range = self.bindings().idx_to_key(idx).range();
 
-        // Solve the binding with a local error collector.
-        //
-        // Only write the errors if we actually write the result - if another thread
-        // or cycle unwinding already wrote the result, we discard the errors.
         let local_errors = self.error_collector();
-        let (answer, did_write) = calculation.record_value(
-            K::solve(self, binding, range, &local_errors),
-            |var, answer| self.finalize_recursive_answer::<K>(idx, var, answer, &local_errors),
-        );
-        if did_write {
-            self.base_errors.extend(local_errors);
-        }
+        let raw_answer = K::solve(self, binding, range, &local_errors);
 
-        // Handle cycle unwinding, if applicable.
-        //
-        // TODO(stroxler): we eventually need to use is-a-cycle-active information to isolate
-        // placeholder values.
-        self.stack().on_calculation_finished(&current);
-        answer
+        // For exported keys, eagerly resolve all type variables in the answer.
+        // This avoids redundant clone+force work in solve_exported_key and post_solve,
+        // which would otherwise repeat this work on every cross-module lookup.
+        // Arc::unwrap_or_clone avoids cloning since the refcount is 1 here.
+        let raw_answer = if K::EXPORTED {
+            let mut forced = Arc::unwrap_or_clone(raw_answer);
+            forced.visit_mut(&mut |x| self.current.solver().deep_force_mut(x));
+            Arc::new(forced)
+        } else {
+            raw_answer
+        };
+
+        if self.stack().is_scc_participant(&current) {
+            // SCC path: store in NodeState::Done, defer Calculation write to batch commit.
+            //
+            // If this is a break_at node (has a placeholder Var), we must finalize
+            // the recursive answer now, before storing. Finalization mutates solver
+            // state (force_var) and must happen during computation, not at batch commit.
+            let answer = if let Some(var) = self.stack().get_scc_placeholder_var(&current) {
+                self.finalize_recursive_answer::<K>(idx, var, raw_answer, &local_errors)
+            } else {
+                raw_answer
+            };
+            let answer_erased: Arc<dyn Any + Send + Sync> = Arc::new(answer.dupe());
+            let canonical_erased = self.stack().on_calculation_finished(
+                &current,
+                Some(answer_erased),
+                Some(Arc::new(local_errors)),
+            );
+            // Use the canonical answer from thread-local state, mirroring how
+            // Calculation::record_value returns the first-written answer.
+            match canonical_erased {
+                Some(erased) => Arc::unwrap_or_clone(
+                    erased
+                        .downcast::<Arc<K::Answer>>()
+                        .expect("on_calculation_finished canonical answer downcast failed"),
+                ),
+                None => answer,
+            }
+        } else {
+            // Non-SCC path: write directly to Calculation as before.
+            // No recursive placeholder can exist in the Calculation cell because
+            // placeholders are stored only in SCC-local NodeState::HasPlaceholder.
+            let (answer, did_write) = calculation.record_value(raw_answer);
+            if did_write {
+                self.base_errors.extend(local_errors);
+            }
+            self.stack().on_calculation_finished(&current, None, None);
+            answer
+        }
+    }
+
+    /// Commit a type-erased answer to the Calculation cell for a same-module binding.
+    /// Used during batch commit when an SCC completes.
+    ///
+    /// The answer was already finalized (force_var called) during calculate_and_record_answer,
+    /// so we use a no-op finalizer here. Errors are only extended into base_errors if
+    /// this thread's write wins (did_write = true).
+    fn commit_typed<K: Solve<Ans>>(
+        &self,
+        idx: Idx<K>,
+        answer: Arc<dyn Any + Send + Sync>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        let typed_answer: Arc<K::Answer> = Arc::unwrap_or_clone(
+            answer
+                .downcast::<Arc<K::Answer>>()
+                .expect("commit_typed: type mismatch in batch commit"),
+        );
+        let calculation = self.get_calculation(idx);
+        // No recursive placeholder can exist in the Calculation cell because
+        // placeholders are stored only in SCC-local NodeState::HasPlaceholder.
+        // The answer was already finalized (force_var called) during
+        // calculate_and_record_answer's SCC path.
+        let (_answer, did_write) = calculation.record_value(typed_answer);
+        if did_write && let Some(errors) = errors {
+            // ErrorCollector::extend takes ownership. Arc::try_unwrap succeeds
+            // because the Arc refcount is 1: the ErrorCollector is moved (not
+            // cloned) at every step from creation through NodeState::Done, SCC
+            // completion, and into this consuming iteration. (Scc::merge may
+            // transiently clone a NodeState, but the original is dropped
+            // immediately, so the refcount returns to 1 before we get here.)
+            let errors = Arc::try_unwrap(errors).expect(
+                "Arc<ErrorCollector> refcount > 1 during batch commit; \
+                 errors would be silently lost. This indicates a bug in SCC lifecycle management.",
+            );
+            self.base_errors.extend(errors);
+        }
+    }
+
+    /// Commit a single preliminary result from a completed SCC.
+    /// Uses dispatch_anyidx! to recover the concrete key type from AnyIdx,
+    /// then delegates to commit_typed<K> for same-module commits or
+    /// LookupAnswer::commit_to_module for cross-module commits.
+    fn commit_single_result(
+        &self,
+        calc_id: CalcId,
+        answer: Arc<dyn Any + Send + Sync>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) {
+        let CalcId(ref bindings, ref any_idx) = calc_id;
+        if bindings.module().name() != self.bindings().module().name() {
+            // Cross-module: delegate to the LookupAnswer trait to route
+            // the commit to the correct module's Answers.
+            self.answers.commit_to_module(calc_id, answer, errors);
+            return;
+        }
+        dispatch_anyidx!(any_idx, self, commit_typed, answer, errors)
+    }
+
+    /// Batch-commit all preliminary answers from a completed SCC.
+    /// Iterates the SCC's node_state map and commits each Done entry
+    /// to the appropriate Calculation cell.
+    ///
+    /// Invariant: all SCC participants should be in `Done` state at this point.
+    /// Nodes with `answer: None` are skipped (they were already committed by
+    /// another thread via the Participant revisit path).
+    fn batch_commit_scc(&self, completed_scc: Scc) {
+        // Validate invariant: no Fresh or InProgress nodes should remain.
+        debug_assert!(
+            completed_scc.node_state.values().all(|state| matches!(
+                state,
+                NodeState::Done { .. } | NodeState::HasPlaceholder(_)
+            )),
+            "batch_commit_scc: SCC has participants that are not Done or HasPlaceholder: {:?}",
+            completed_scc
+                .node_state
+                .iter()
+                .filter(|(_, s)| matches!(s, NodeState::Fresh | NodeState::InProgress))
+                .map(|(id, s)| format!("{}: {:?}", id, s))
+                .collect::<Vec<_>>(),
+        );
+        for (calc_id, node_state) in completed_scc.node_state {
+            if let NodeState::Done {
+                answer: Some(answer),
+                errors,
+            } = node_state
+            {
+                self.commit_single_result(calc_id, answer, errors);
+            }
+        }
     }
 
     /// Finalize a recursive answer. This takes the raw value produced by `K::solve` and calls
@@ -1086,38 +1449,33 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
 
     /// Attempt to record a cycle placeholder result to unwind a cycle from here.
     ///
-    /// Returns a `Result` where the normal case is `Err`, because another thread
-    /// might have already finished the cycle in which case we can just use that result
-    /// (which will come in an `Ok(result)` form)
+    /// Returns a `Result` where `Err(var)` is the normal case (placeholder created,
+    /// cycle should be unwound), and `Ok(value)` means another thread has already
+    /// committed a final answer so we can skip the cycle-breaking entirely.
     ///
-    /// TODO: eventually we should be recording this answer in a thread-local place rather
-    /// than in the Calculation for better isolation against data races. Once that plumbing
-    /// is in place, this code can probably be simplified to just return the recursive result;
-    /// we are doing extra work here to get partial protection against races through the mutex.
+    /// Note: The placeholder is recorded in SCC-local state (NodeState::HasPlaceholder),
+    /// not in the Calculation cell. Each thread that hits the same cycle creates its
+    /// own placeholder. The final answer IS written thread-locally via NodeState::Done
+    /// and only committed to Calculation during batch commit when the SCC completes.
     fn attempt_to_unwind_cycle_from_here<K: Solve<Ans>>(
         &self,
         current: &CalcId,
         idx: Idx<K>,
-        calculation: &Calculation<Arc<K::Answer>, Var>,
+        calculation: &Calculation<Arc<K::Answer>>,
     ) -> Result<Arc<K::Answer>, Var>
     where
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
+        // Check if another thread already committed a final answer.
+        if let Some(v) = calculation.get() {
+            return Ok(v);
+        }
+        // Create a recursive placeholder and store it only in SCC-local state.
         let binding = self.bindings().get(idx);
         let rec = K::create_recursive(self, binding);
-        match calculation.record_cycle(rec) {
-            Either::Right(rec) => {
-                // No final answer is available, so we'll unwind the cycle using `rec`.
-                // Track that we've recorded a placeholder for this break_at node.
-                self.stack().on_placeholder_recorded(current);
-                Err(rec)
-            }
-            Either::Left(v) => {
-                // Another thread already completed a final result, we can just use it.
-                Ok(v)
-            }
-        }
+        self.stack().on_placeholder_recorded(current, rec);
+        Err(rec)
     }
 
     /// Handle depth overflow based on the configured handler.
@@ -1125,7 +1483,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         current: &CalcId,
         idx: Idx<K>,
-        calculation: &Calculation<Arc<K::Answer>, Var>,
+        calculation: &Calculation<Arc<K::Answer>>,
         config: RecursionLimitConfig,
     ) -> Arc<K::Answer>
     where
@@ -1151,7 +1509,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         current: &CalcId,
         idx: Idx<K>,
-        calculation: &Calculation<Arc<K::Answer>, Var>,
+        calculation: &Calculation<Arc<K::Answer>>,
         limit: u32,
     ) -> Arc<K::Answer>
     where
@@ -1522,6 +1880,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
 mod scc_tests {
     use super::*;
 
+    /// Create a dummy `NodeState::Done` for testing.
+    fn done_for_test() -> NodeState {
+        NodeState::Done {
+            answer: None,
+            errors: None,
+        }
+    }
+
     /// Helper to create a test Scc with given parameters.
     ///
     /// This bypasses the normal Scc::new constructor to allow direct construction
@@ -1533,7 +1899,7 @@ mod scc_tests {
     #[allow(clippy::mutable_key_type)]
     fn make_test_scc(
         break_at: Vec<CalcId>,
-        node_state: HashMap<CalcId, NodeState>,
+        node_state: BTreeMap<CalcId, NodeState>,
         detected_at: CalcId,
         anchor_pos: usize,
     ) -> Scc {
@@ -1558,7 +1924,7 @@ mod scc_tests {
 
     /// Helper to create node_state map with all nodes Fresh.
     #[allow(clippy::mutable_key_type)]
-    fn fresh_nodes(ids: &[CalcId]) -> HashMap<CalcId, NodeState> {
+    fn fresh_nodes(ids: &[CalcId]) -> BTreeMap<CalcId, NodeState> {
         ids.iter().map(|id| (id.dupe(), NodeState::Fresh)).collect()
     }
 
@@ -1808,13 +2174,13 @@ mod scc_tests {
         let b = CalcId::for_test("m", 1);
 
         // SCC1 has M0 as Done, M1 as Fresh
-        let mut scc1_state = HashMap::new();
-        scc1_state.insert(a.dupe(), NodeState::Done);
+        let mut scc1_state = BTreeMap::new();
+        scc1_state.insert(a.dupe(), done_for_test());
         scc1_state.insert(b.dupe(), NodeState::Fresh);
         let scc1 = make_test_scc(vec![a.dupe()], scc1_state, a.dupe(), 0);
 
         // SCC2 has M0 as Fresh, M1 as InProgress
-        let mut scc2_state = HashMap::new();
+        let mut scc2_state = BTreeMap::new();
         scc2_state.insert(a.dupe(), NodeState::Fresh);
         scc2_state.insert(b.dupe(), NodeState::InProgress);
         let scc2 = make_test_scc(vec![a.dupe()], scc2_state, a.dupe(), 0);
@@ -1822,8 +2188,14 @@ mod scc_tests {
         let merged = Scc::merge_many(vec1![scc1, scc2], a.dupe());
 
         // Should take the most advanced state for each node
-        assert_eq!(merged.node_state.get(&a), Some(&NodeState::Done));
-        assert_eq!(merged.node_state.get(&b), Some(&NodeState::InProgress));
+        assert!(matches!(
+            merged.node_state.get(&a),
+            Some(NodeState::Done { .. })
+        ));
+        assert!(matches!(
+            merged.node_state.get(&b),
+            Some(NodeState::InProgress)
+        ));
     }
 
     #[test]

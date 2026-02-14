@@ -14,6 +14,8 @@ use std::fmt::Display;
 use std::mem;
 use std::sync::Arc;
 
+use pyrefly_types::dimension::ShapeError;
+use pyrefly_types::dimension::simplify;
 use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::simplify::intersect;
@@ -458,13 +460,17 @@ impl Solver {
         }
     }
 
+    pub fn expand_dimension(&self, dim_ty: &mut Type) {
+        self.expand_with_limit(dim_ty, TYPE_LIMIT, &VarRecurser::new());
+    }
+
     /// Given a `Var`, ensures that the solver has an answer for it (or inserts Any if not already),
     /// and returns that answer. Note that if the `Var` is already bound to something that contains a
     /// `Var` (including itself), then we will return the answer.
     pub fn force_var(&self, v: Var) -> Type {
         let lock = self.variables.lock();
         let mut e = lock.get_mut(v);
-        match &mut *e {
+        let result = match &mut *e {
             Variable::Answer(t) => t.clone(),
             Variable::LoopRecursive(prior_type, bound) => {
                 *bound = LoopBound::Prior;
@@ -482,7 +488,22 @@ impl Solver {
                 *e = Variable::Answer(ty.clone());
                 ty
             }
-        }
+        };
+        // Simplify dimension expressions after forcing
+        // This ensures Tensor[(10 * 20)] becomes Tensor[200]
+        self.simplify_forced_type(result)
+    }
+
+    /// Simplify dimension expressions in a forced type
+    fn simplify_forced_type(&self, mut ty: Type) -> Type {
+        // Use transform_mut to visit every Type node and simplify dimensions
+        ty.transform_mut(&mut |t| {
+            let simplified = simplify(t.clone());
+            if &simplified != t {
+                *t = simplified;
+            }
+        });
+        ty
     }
 
     fn deep_force_mut_with_limit(&self, t: &mut Type, limit: usize, recurser: &VarRecurser) {
@@ -499,6 +520,12 @@ impl Solver {
             }
         } else {
             t.recurse_mut(&mut |t| self.deep_force_mut_with_limit(t, limit - 1, recurser));
+            // After forcing all Vars recursively, simplify dimension expressions
+            // This handles cases like Tensor[(10 * 20)] after Vars are forced to 10 and 20
+            let simplified = simplify(t.clone());
+            if &simplified != t {
+                *t = simplified;
+            }
         }
     }
 
@@ -722,7 +749,7 @@ impl Solver {
             return (QuantifiedHandle::empty(), t);
         }
 
-        let qs = params.iter().map(|p| &p.quantified).collect::<Vec<_>>();
+        let qs = params.iter().collect::<Vec<_>>();
         let vs = self.fresh_quantified_vars(&qs, uniques);
         let ts = vs.0.map(|v| v.to_type(&self.heap));
         let t = t.subst(&qs.into_iter().zip(&ts).collect());
@@ -750,7 +777,7 @@ impl Solver {
         // Collect tparams that appear in the first parameter.
         let mut qs = Vec::new();
         self_param.for_each_quantified(&mut |q| {
-            if tparams.iter().any(|tparam| tparam.quantified == *q) {
+            if tparams.iter().any(|tparam| *tparam == *q) {
                 qs.push(q);
             }
         });
@@ -838,12 +865,12 @@ impl Solver {
         let mut lock = self.variables.lock();
         targs.iter_paired_mut().for_each(|(param, t)| {
             if let Type::Quantified(q) = t
-                && **q == param.quantified
+                && **q == *param
             {
                 let v = Var::new(uniques);
                 vs.push(v);
                 *t = v.to_type(&self.heap);
-                lock.insert_fresh(v, Variable::Quantified(param.quantified.clone()));
+                lock.insert_fresh(v, Variable::Quantified(param.clone()));
             }
         });
         QuantifiedHandle(vs)
@@ -862,9 +889,9 @@ impl Solver {
         targs.iter_paired_mut().for_each(|(param, t)| {
             if let Type::Var(v) = t
                 && let Variable::Quantified(q) = &*lock.get(*v)
-                && *q == param.quantified
+                && *q == *param
             {
-                *t = param.quantified.clone().to_type(&self.heap);
+                *t = param.clone().to_type(&self.heap);
             }
         })
     }
@@ -879,7 +906,7 @@ impl Solver {
         let mut new_targs: Vec<Option<Type>> = Vec::with_capacity(targs.len());
         targs.iter_paired().enumerate().for_each(|(i, (param, t))| {
             let new_targ = if let Type::Quantified(q) = t
-                && **q == param.quantified
+                && **q == *param
             {
                 if let Some(default) = param.default() {
                     // Note that TypeVars are stored in Type::TypeVar form, and have not yet been
@@ -902,7 +929,7 @@ impl Solver {
                                     .unwrap_or_else(|| &targs.as_slice()[*i])
                                     .clone()
                             } else {
-                                param.quantified.as_gradual_type()
+                                param.as_gradual_type()
                             }
                         }
                     });
@@ -1363,6 +1390,8 @@ pub enum SubsetError {
     TypeOfProtocolNeedsConcreteClass(Name),
     /// A `type` cannot accept special forms like `Callable`
     TypeCannotAcceptSpecialForms(SpecialForm),
+    /// Tensor shape or dimension error
+    TensorShape(ShapeError),
     // TODO(rechen): replace this with specific reasons
     Other,
 }
@@ -1397,6 +1426,7 @@ impl SubsetError {
                 "`type` cannot accept special form `{}` as an argument",
                 form
             )),
+            SubsetError::TensorShape(err) => Some(err.to_string()),
             SubsetError::Other => None,
         }
     }
