@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::env;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -27,14 +28,18 @@ use pyrefly_graph::index::Idx;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_types::heap::TypeHeap;
+use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::type_alias::TypeAlias;
 use pyrefly_types::type_alias::TypeAliasData;
-use pyrefly_types::type_alias::TypeAliasRef;
+use pyrefly_types::type_var::PreInferenceVariance;
+use pyrefly_types::type_var::Restriction;
 use pyrefly_types::types::Union;
 use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::recurser::Guard;
 use pyrefly_util::uniques::UniqueFactory;
 use pyrefly_util::visit::VisitMut;
+use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use starlark_map::Hashed;
 use starlark_map::small_set::SmallSet;
@@ -51,6 +56,7 @@ use crate::alt::traits::Solve;
 use crate::binding::binding::AnyIdx;
 use crate::binding::binding::Binding;
 use crate::binding::binding::Exported;
+use crate::binding::binding::Key;
 use crate::binding::binding::KeyExport;
 use crate::binding::binding::KeyTypeAlias;
 use crate::binding::bindings::BindingEntry;
@@ -59,6 +65,7 @@ use crate::binding::bindings::Bindings;
 use crate::binding::table::TableKeyed;
 use crate::config::base::RecursionLimitConfig;
 use crate::config::base::RecursionOverflowHandler;
+use crate::config::base::SccMode;
 use crate::config::error_kind::ErrorKind;
 use crate::dispatch_anyidx;
 use crate::error::collector::ErrorCollector;
@@ -70,6 +77,8 @@ use crate::module::module_info::ModuleInfo;
 use crate::solver::solver::VarRecurser;
 use crate::solver::type_order::TypeOrder;
 use crate::types::class::Class;
+use crate::types::equality::TypeEq;
+use crate::types::equality::TypeEqCtx;
 use crate::types::stdlib::Stdlib;
 use crate::types::type_info::TypeInfo;
 use crate::types::types::Type;
@@ -82,7 +91,13 @@ pub struct CalcId(pub Bindings, pub AnyIdx);
 
 impl Debug for CalcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CalcId({}, {:?})", self.0.module().name(), self.1)
+        write!(
+            f,
+            "CalcId({}, {}, {:?})",
+            self.0.module().name(),
+            self.0.module().path(),
+            self.1,
+        )
     }
 }
 
@@ -90,8 +105,9 @@ impl Display for CalcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CalcId({}, {})",
+            "CalcId({}, {}, {})",
             self.0.module().name(),
+            self.0.module().path(),
             self.1.display_with(&self.0),
         )
     }
@@ -99,7 +115,8 @@ impl Display for CalcId {
 
 impl PartialEq for CalcId {
     fn eq(&self, other: &Self) -> bool {
-        (self.0.module().name(), &self.1) == (other.0.module().name(), &other.1)
+        (self.0.module().name(), self.0.module().path(), &self.1)
+            == (other.0.module().name(), other.0.module().path(), &other.1)
     }
 }
 
@@ -108,7 +125,10 @@ impl Eq for CalcId {}
 impl Ord for CalcId {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.1.cmp(&other.1) {
-            Ordering::Equal => self.0.module().name().cmp(&other.0.module().name()),
+            Ordering::Equal => match self.0.module().name().cmp(&other.0.module().name()) {
+                Ordering::Equal => self.0.module().path().cmp(other.0.module().path()),
+                not_equal => not_equal,
+            },
             not_equal => not_equal,
         }
     }
@@ -123,6 +143,7 @@ impl PartialOrd for CalcId {
 impl Hash for CalcId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.module().name().hash(state);
+        self.0.module().path().hash(state);
         self.1.hash(state);
     }
 }
@@ -136,8 +157,6 @@ impl CalcId {
     #[cfg(test)]
     pub fn for_test(module_name: &str, idx: usize) -> Self {
         use pyrefly_graph::index::Idx;
-
-        use crate::binding::binding::Key;
 
         let bindings = Bindings::for_test(module_name);
         // Create a fake Key index - the actual key doesn't matter for test purposes,
@@ -162,16 +181,26 @@ pub struct CalcStack {
     /// SCCs that completed during `on_calculation_finished` but haven't been
     /// batch-committed yet. Drained by `get_idx` after each frame completes.
     pending_completed_sccs: RefCell<Vec<Scc>>,
+    /// The SCC solving mode, propagated from `ThreadState` at construction time.
+    /// This makes the mode accessible during SCC operations without needing a
+    /// back-reference to `ThreadState`.
+    scc_solving_mode: SccSolvingMode,
 }
 
 impl CalcStack {
-    pub fn new() -> Self {
+    fn new(scc_solving_mode: SccSolvingMode) -> Self {
         Self {
             stack: RefCell::new(Vec::new()),
             scc_stack: RefCell::new(Vec::new()),
             position_of: RefCell::new(FxHashMap::default()),
             pending_completed_sccs: RefCell::new(Vec::new()),
+            scc_solving_mode,
         }
+    }
+
+    /// Returns true when the SCC solving mode is `Iterative`.
+    fn is_iterative(&self) -> bool {
+        self.scc_solving_mode == SccSolvingMode::Iterative
     }
 
     /// Pop the current frame and drain any SCCs that completed during it.
@@ -225,18 +254,263 @@ impl CalcStack {
             .entry(current.dupe())
             .and_modify(|positions| positions.push(position))
             .or_insert_with(|| Vec1::new(position));
+
+        // Membership back-edge detection: when iterative mode is active, check
+        // if the target is a member of a *non-top* iterating SCC. If so, this
+        // is a cross-SCC back-edge that must merge all SCCs from that index to
+        // the top and demote (restart at iteration 1).
+        //
+        // This check runs BEFORE the top-SCC iterative bypass because cross-SCC
+        // back-edges must be caught first. SCCs still in Phase 0 discovery
+        // (iterative: None) are handled by the existing `on_scc_detected` path.
+        //
+        // Borrow safety: `find_iterating_scc_containing` returns an owned
+        // `Option<usize>`, so the shared borrow on `scc_stack` is released
+        // before the exclusive borrow needed for merging.
+        if self.is_iterative()
+            && let Some(scc_idx) = self.find_iterating_scc_containing(&current)
+        {
+            let is_non_top = {
+                let scc_stack = self.scc_stack.borrow();
+                scc_idx < scc_stack.len() - 1
+            };
+            if is_non_top {
+                // Merge all SCCs from scc_idx to the top of the stack.
+                // This produces a single merged SCC with merge_happened = true
+                // (via Scc::merge's iteration state merge logic). Demotion
+                // is deferred to drive_all_iteration_members.
+                {
+                    let calc_stack_vec = self.into_vec();
+                    let mut scc_stack = self.scc_stack.borrow_mut();
+                    let mut sccs_to_merge: Vec<Scc> = scc_stack.drain(scc_idx..).collect();
+                    // Reverse so the top SCC (last in drain order) appears first,
+                    // matching merge_sccs order: merge_many gives priority to the
+                    // first element's iteration states.
+                    sccs_to_merge.reverse();
+                    let sccs_to_merge = Vec1::try_from_vec(sccs_to_merge)
+                        .expect("membership back-edge: at least the found SCC must be present");
+                    // detected_at is just an extra min-candidate; merge_many
+                    // takes min across all SCCs regardless of which we pass here.
+                    let detected_at = sccs_to_merge.first().detected_at.dupe();
+                    let mut merged = Scc::merge_many(sccs_to_merge, detected_at);
+                    // Recompute segment_size after merge.
+                    merged.segment_size = calc_stack_vec.len() - merged.anchor_pos;
+
+                    // Add free-floating CalcStack nodes (between merged SCCs)
+                    // to node_state and iterative.node_states, mirroring merge_sccs.
+                    for calc_id in calc_stack_vec.iter().skip(merged.anchor_pos) {
+                        merged
+                            .node_state
+                            .entry(calc_id.dupe())
+                            .or_insert(NodeState::InProgress);
+                    }
+                    if let Some(ref mut iter_state) = merged.iterative {
+                        let mut added_new = false;
+                        for calc_id in calc_stack_vec.iter().skip(merged.anchor_pos) {
+                            iter_state
+                                .node_states
+                                .entry(calc_id.dupe())
+                                .or_insert_with(|| {
+                                    added_new = true;
+                                    IterationNodeState::Fresh
+                                });
+                        }
+                        if added_new {
+                            iter_state.merge_happened = true;
+                        }
+                    }
+
+                    scc_stack.push(merged);
+                }
+                // The target is now in the top SCC's iteration state.
+                // Determine the appropriate action based on iteration state.
+                // After merge, existing iteration states are preserved (Done/
+                // InProgress stay as-is) and new members are Fresh. The target
+                // will typically be Fresh or InProgress. Handle all cases.
+                if let Some(kind) = self.get_iteration_node_state(&current) {
+                    return match kind {
+                        IterationNodeStateKind::Fresh => {
+                            self.set_iteration_node_in_progress(&current);
+                            BindingAction::Calculate
+                        }
+                        IterationNodeStateKind::InProgressWithPreviousAnswer => {
+                            let answer = self.get_previous_answer(&current).expect(
+                                "InProgressWithPreviousAnswer but no previous answer found",
+                            );
+                            BindingAction::SccLocalAnswer(answer)
+                        }
+                        IterationNodeStateKind::InProgressWithPlaceholder => {
+                            let var = self
+                                .get_iteration_placeholder(&current)
+                                .expect("InProgressWithPlaceholder but no placeholder found");
+                            BindingAction::CycleBroken(var)
+                        }
+                        IterationNodeStateKind::InProgressCold => {
+                            BindingAction::NeedsColdPlaceholder
+                        }
+                        IterationNodeStateKind::Done => {
+                            let answer = self
+                                .get_iteration_done_answer(&current)
+                                .expect("Done iteration node state but no answer found");
+                            BindingAction::SccLocalAnswer(answer)
+                        }
+                    };
+                }
+                // If we merged but the target is somehow not in iteration state,
+                // this is a bug: the merge should have included it.
+                unreachable!(
+                    "membership back-edge: target {} was in iterating SCC but \
+                     not found in merged SCC's iteration state",
+                    current,
+                );
+            }
+            // The target is now in the top SCC's iteration state.
+            // Determine the appropriate action based on iteration state.
+            // After merge with demotion, the iteration state is fresh
+            // (iteration 1, all nodes Fresh, no previous answers), so the
+            // target will typically be Fresh. But we handle all cases for
+            // robustness.
+            if let Some(kind) = self.get_iteration_node_state(&current) {
+                return match kind {
+                    IterationNodeStateKind::Fresh => {
+                        self.set_iteration_node_in_progress(&current);
+                        BindingAction::Calculate
+                    }
+                    IterationNodeStateKind::InProgressWithPreviousAnswer => {
+                        let answer = self
+                            .get_previous_answer(&current)
+                            .expect("InProgressWithPreviousAnswer but no previous answer found");
+                        BindingAction::SccLocalAnswer(answer)
+                    }
+                    IterationNodeStateKind::InProgressWithPlaceholder => {
+                        let var = self
+                            .get_iteration_placeholder(&current)
+                            .expect("InProgressWithPlaceholder but no placeholder found");
+                        BindingAction::CycleBroken(var)
+                    }
+                    IterationNodeStateKind::InProgressCold => BindingAction::NeedsColdPlaceholder,
+                    IterationNodeStateKind::Done => {
+                        let answer = self
+                            .get_iteration_done_answer(&current)
+                            .expect("Done iteration node state but no answer found");
+                        BindingAction::SccLocalAnswer(answer)
+                    }
+                };
+            }
+            // If we merged but the target is somehow not in iteration state,
+            // this is a bug: the merge should have included it.
+            unreachable!(
+                "membership back-edge: target {} was in iterating SCC but \
+                     not found in merged SCC's iteration state",
+                current,
+            );
+        }
+
+        // Iterative bypass: when iterative mode is active and the top SCC is
+        // iterating, check if the target is a member of the top SCC's iteration
+        // state. If so, use SCC-scoped iteration state to determine the action
+        // instead of falling through to the legacy SCC logic.
+        //
+        // Borrow safety: `get_iteration_node_state` returns an owned
+        // `IterationNodeStateKind`, so the shared borrow on `scc_stack` is
+        // released before any exclusive borrow for mutation.
+        if self.is_iterative()
+            && let Some(kind) = self.get_iteration_node_state(&current)
+        {
+            // The node was unconditionally pushed onto the raw CalcStack
+            // above, and pop() will decrement segment_size for any node
+            // in the top SCC's node_state. We must increment here to
+            // keep segment_size symmetric, since the early return below
+            // bypasses the segment_size += 1 in the SccState::Participant
+            // arm.
+            if let Some(top_scc) = self.scc_stack.borrow_mut().last_mut() {
+                top_scc.segment_size += 1;
+            }
+            return match kind {
+                IterationNodeStateKind::Fresh => {
+                    // First encounter in this iteration: mark InProgress
+                    // and proceed to calculate.
+                    self.set_iteration_node_in_progress(&current);
+                    BindingAction::Calculate
+                }
+                IterationNodeStateKind::InProgressWithPreviousAnswer => {
+                    // Back-edge with a warm-start answer from prior iteration.
+                    let answer = self
+                        .get_previous_answer(&current)
+                        .expect("InProgressWithPreviousAnswer but no previous answer found");
+                    BindingAction::SccLocalAnswer(answer)
+                }
+                IterationNodeStateKind::InProgressWithPlaceholder => {
+                    // Back-edge with a placeholder already allocated.
+                    let var = self
+                        .get_iteration_placeholder(&current)
+                        .expect("InProgressWithPlaceholder but no placeholder found");
+                    BindingAction::CycleBroken(var)
+                }
+                IterationNodeStateKind::InProgressCold => {
+                    // Cold-start back-edge: no placeholder, no previous answer.
+                    // Return NeedsColdPlaceholder so the caller (get_idx) can
+                    // allocate via K::create_recursive.
+                    BindingAction::NeedsColdPlaceholder
+                }
+                IterationNodeStateKind::Done => {
+                    // Already solved in this iteration; return the answer.
+                    let answer = self
+                        .get_iteration_done_answer(&current)
+                        .expect("Done iteration node state but no answer found");
+                    BindingAction::SccLocalAnswer(answer)
+                }
+            };
+        }
+
         match self.pre_calculate_state(&current) {
             SccState::NotInScc | SccState::RevisitingInProgress => {
                 match calculation.propose_calculation() {
                     ProposalResult::Calculated(v) => BindingAction::Calculated(v),
-                    ProposalResult::CycleDetected => {
-                        let current_cycle = self.current_cycle().unwrap();
-                        match self.on_scc_detected(current_cycle) {
-                            SccDetectedResult::BreakHere => BindingAction::Unwind,
-                            SccDetectedResult::Continue => BindingAction::Calculate,
+                    // Use the thread-local stack as the source of truth for
+                    // cycle detection: `position_of` tells us definitively
+                    // whether this CalcId has a live frame on the current stack.
+                    ProposalResult::Calculatable => {
+                        if let Some(current_cycle) = self.current_cycle() {
+                            match self.on_scc_detected(current_cycle) {
+                                SccDetectedResult::BreakHere => BindingAction::Unwind,
+                                SccDetectedResult::Continue => BindingAction::Calculate,
+                            }
+                        } else {
+                            // No cycle on the stack: this node simply needs
+                            // computing. This is the normal case for both
+                            // iterative and legacy modes.
+                            BindingAction::Calculate
                         }
                     }
-                    ProposalResult::Calculatable => BindingAction::Calculate,
+                    ProposalResult::CycleDetected => {
+                        if let Some(current_cycle) = self.current_cycle() {
+                            match self.on_scc_detected(current_cycle) {
+                                SccDetectedResult::BreakHere => BindingAction::Unwind,
+                                SccDetectedResult::Continue => BindingAction::Calculate,
+                            }
+                        } else if self.is_iterative()
+                            && self.get_iteration_node_state(&current).is_some()
+                        {
+                            // In iterative mode, CycleDetected without an active
+                            // cycle means Phase 0 left stale Calculating state
+                            // (the thread started this node in a previous
+                            // iteration but the stack was unwound). Treat as a
+                            // cold-start back-edge: the caller (get_idx) will
+                            // allocate a placeholder via K::create_recursive.
+                            BindingAction::NeedsColdPlaceholder
+                        } else {
+                            // Legacy mode: CycleDetected without a stack cycle is
+                            // surprising but has been observed in LSP. The thread
+                            // started a calculation but never saved an answer, and
+                            // the stack frame is gone. Proceed with Calculate as a
+                            // best-effort fallback.
+                            //
+                            // TODO: This may indicate a bug in SCC merging, state
+                            // transition tracking, or batch commit.
+                            BindingAction::Calculate
+                        }
+                    }
                 }
             }
             SccState::RevisitingDone => {
@@ -487,7 +761,7 @@ impl CalcStack {
             }
         }
 
-        if let Some(first_idx) = first_merge_idx {
+        let result = if let Some(first_idx) = first_merge_idx {
             // Merge all SCCs from first_idx to end, plus the new SCC
             let sccs_from_stack: Vec<Scc> = scc_stack.drain(first_idx..).collect();
             let sccs_to_merge = Vec1::from_vec_push(sccs_from_stack, new_scc);
@@ -515,7 +789,16 @@ impl CalcStack {
             };
             scc_stack.push(new_scc);
             result
+        };
+
+        // Iterative mode never uses min-idx breaking: every back-edge breaks
+        // immediately. This ensures Phase 0 is purely membership discovery and
+        // that no frame continues past its own cycle detection point.
+        if self.is_iterative() {
+            return SccDetectedResult::BreakHere;
         }
+
+        result
     }
 
     /// Check the SCC state for a node before calculating it.
@@ -705,11 +988,409 @@ impl CalcStack {
                 .or_insert(NodeState::InProgress);
         }
 
+        // If the merged SCC is iterating, ensure free-floating nodes that were
+        // just added to node_state are also present in iterative.node_states.
+        // Without this, next_fresh_member() won't see them and they'll bypass
+        // iterative error suppression and convergence tracking until the next
+        // iteration rebuilds node_states from scratch.
+        if let Some(ref mut iter_state) = merged.iterative {
+            let mut added_new = false;
+            for calc_id in calc_stack_vec.iter().skip(min_depth) {
+                iter_state
+                    .node_states
+                    .entry(calc_id.dupe())
+                    .or_insert_with(|| {
+                        added_new = true;
+                        IterationNodeState::Fresh
+                    });
+            }
+            if added_new {
+                iter_state.merge_happened = true;
+            }
+        }
+
         // After a merge, everything from the merged anchor to the current stack top
         // is part of this single SCC. Recompute segment_size from scratch.
         merged.segment_size = calc_stack_vec.len() - merged.anchor_pos;
 
         scc_stack.push(merged);
+    }
+
+    /// Find the index in `scc_stack` of an iterating SCC that contains `target`.
+    ///
+    /// Scans the SCC stack for an SCC with `iterative: Some(...)` whose
+    /// `node_state` (legacy membership map) contains the target. Returns the index in the stack
+    /// (not the SCC's `anchor_pos`). Used for membership-based back-edge
+    /// detection: a request for a CalcId in a non-top iterating SCC is a
+    /// back-edge that must trigger merge + demotion.
+    fn find_iterating_scc_containing(&self, target: &CalcId) -> Option<usize> {
+        let scc_stack = self.scc_stack.borrow();
+        for (i, scc) in scc_stack.iter().enumerate() {
+            if scc.iterative.is_some() && scc.node_state.contains_key(target) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Returns true if `target` is a member of any iterating SCC on the stack.
+    #[allow(dead_code)]
+    fn is_iterating_member(&self, target: &CalcId) -> bool {
+        self.find_iterating_scc_containing(target).is_some()
+    }
+
+    /// Returns true if the top SCC is iterating at iteration 1 (cold start).
+    ///
+    /// During cold-start iteration, back-edges allocate placeholders rather
+    /// than reusing previous answers.
+    fn is_cold_iteration(&self) -> bool {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .and_then(|scc| scc.iterative.as_ref())
+            .is_some_and(|iter_state| iter_state.iteration == 1)
+    }
+
+    /// Returns true if the top SCC is iterating at iteration >= 2.
+    ///
+    /// This is used to decide whether to suppress errors: errors are
+    /// swallowed during iteration 1 and collected from iteration 2 onward.
+    /// The name "final" is a misnomer since more iterations may follow;
+    /// it means "past cold start."
+    #[allow(dead_code)]
+    fn is_final_iteration(&self) -> bool {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .and_then(|scc| scc.iterative.as_ref())
+            .is_some_and(|iter_state| iter_state.iteration >= 2)
+    }
+
+    /// Get the lightweight summary of a target's iteration node state in
+    /// the top SCC.
+    ///
+    /// Returns `None` if the top SCC is not iterating or the target is not
+    /// found in the iteration node states. The summary is safe to use for
+    /// read-then-act patterns because it does not borrow the SCC.
+    fn get_iteration_node_state(&self, target: &CalcId) -> Option<IterationNodeStateKind> {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last()?;
+        let iter_state = top_scc.iterative.as_ref()?;
+        let node_state = iter_state.node_states.get(target)?;
+        let has_previous_answer = iter_state.previous_answers.contains_key(target);
+        Some(node_state.kind(has_previous_answer))
+    }
+
+    /// Mark a target node as `InProgress` in the top SCC's iteration state.
+    ///
+    /// Panics if the top SCC is not iterating, the target is not a member,
+    /// or the target is not `Fresh`.
+    fn set_iteration_node_in_progress(&self, target: &CalcId) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        let top_scc = scc_stack.last_mut().expect("no SCC on the stack");
+        let iter_state = top_scc
+            .iterative
+            .as_mut()
+            .expect("top SCC is not iterating");
+        let node_state = iter_state
+            .node_states
+            .get_mut(target)
+            .expect("target is not a member of the iterating SCC");
+        assert!(
+            matches!(node_state, IterationNodeState::Fresh),
+            "set_iteration_node_in_progress called on non-Fresh node: {target:?}"
+        );
+        *node_state = IterationNodeState::InProgress { placeholder: None };
+    }
+
+    /// Set the placeholder variable on an existing `InProgress` iteration
+    /// node state for the target.
+    ///
+    /// Panics if the target is not found or is not `InProgress`.
+    fn set_iteration_placeholder(&self, target: &CalcId, var: Var) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        let top_scc = scc_stack.last_mut().expect("no SCC on the stack");
+        let iter_state = top_scc
+            .iterative
+            .as_mut()
+            .expect("top SCC is not iterating");
+        let node_state = iter_state
+            .node_states
+            .get_mut(target)
+            .expect("target is not a member of the iterating SCC");
+        match node_state {
+            IterationNodeState::InProgress { placeholder } => {
+                *placeholder = Some(var);
+            }
+            _ => panic!(
+                "set_iteration_placeholder called on a node that is not InProgress: {:?}",
+                node_state
+            ),
+        }
+    }
+
+    /// Get the placeholder variable from the target's `InProgress` state,
+    /// if one exists.
+    ///
+    /// Returns `None` if the top SCC is not iterating, the target is not
+    /// found, the target is not `InProgress`, or no placeholder has been set.
+    fn get_iteration_placeholder(&self, target: &CalcId) -> Option<Var> {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last()?;
+        let iter_state = top_scc.iterative.as_ref()?;
+        match iter_state.node_states.get(target)? {
+            IterationNodeState::InProgress {
+                placeholder: Some(var),
+            } => Some(*var),
+            _ => None,
+        }
+    }
+
+    /// Mark a target node as `Done` in the top SCC's iteration state.
+    ///
+    /// Panics if the top SCC is not iterating.
+    fn set_iteration_node_done(
+        &self,
+        target: &CalcId,
+        answer: Arc<dyn Any + Send + Sync>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        let top_scc = scc_stack.last_mut().expect("no SCC on the stack");
+        let iter_state = top_scc
+            .iterative
+            .as_mut()
+            .expect("top SCC is not iterating");
+        iter_state
+            .node_states
+            .insert(target.dupe(), IterationNodeState::Done { answer, errors });
+    }
+
+    /// Set `has_changed = true` on the top SCC's iteration state.
+    ///
+    /// Called when a node's answer differs from its previous-iteration answer,
+    /// indicating the fixpoint has not yet converged.
+    ///
+    /// Panics if the top SCC is not iterating.
+    fn mark_iteration_changed(&self) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        let top_scc = scc_stack.last_mut().expect("no SCC on the stack");
+        let iter_state = top_scc
+            .iterative
+            .as_mut()
+            .expect("top SCC is not iterating");
+        iter_state.has_changed = true;
+    }
+
+    /// Look up the previous-iteration answer for a target in the top SCC.
+    ///
+    /// Returns `None` if the top SCC is not iterating or there is no
+    /// previous answer for the target (e.g., during cold-start iteration 1).
+    fn get_previous_answer(&self, target: &CalcId) -> Option<Arc<dyn Any + Send + Sync>> {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last()?;
+        let iter_state = top_scc.iterative.as_ref()?;
+        iter_state.previous_answers.get(target).cloned()
+    }
+
+    /// Retrieve the type-erased answer from `IterationNodeState::Done` in the
+    /// top SCC's iteration state.
+    ///
+    /// Returns `None` if the top SCC is not iterating, the target is not
+    /// found, or the target is not `Done`.
+    fn get_iteration_done_answer(&self, target: &CalcId) -> Option<Arc<dyn Any + Send + Sync>> {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last()?;
+        let iter_state = top_scc.iterative.as_ref()?;
+        match iter_state.node_states.get(target)? {
+            IterationNodeState::Done { answer, .. } => Some(answer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Find the first member in the top SCC's iteration state that is `Fresh`.
+    ///
+    /// Returns `None` if all members have been processed or the top SCC is
+    /// not iterating. BTreeMap iteration order gives deterministic results.
+    fn next_fresh_member(&self) -> Option<CalcId> {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last()?;
+        let iter_state = top_scc.iterative.as_ref()?;
+        for (calc_id, state) in &iter_state.node_states {
+            if matches!(state, IterationNodeState::Fresh) {
+                return Some(calc_id.dupe());
+            }
+        }
+        None
+    }
+
+    /// Extract done answers from the top SCC's iteration state.
+    ///
+    /// Iterates over `node_states`, collecting answers from `Done` variants.
+    /// Used to build `previous_answers` for the next iteration. Returns an
+    /// empty map if the top SCC is not iterating.
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn extract_previous_answers(&self) -> BTreeMap<CalcId, Arc<dyn Any + Send + Sync>> {
+        let scc_stack = self.scc_stack.borrow();
+        let Some(top_scc) = scc_stack.last() else {
+            return BTreeMap::new();
+        };
+        let Some(iter_state) = top_scc.iterative.as_ref() else {
+            return BTreeMap::new();
+        };
+        let mut answers = BTreeMap::new();
+        for (calc_id, state) in &iter_state.node_states {
+            if let IterationNodeState::Done { answer, .. } = state {
+                answers.insert(calc_id.dupe(), answer.clone());
+            }
+        }
+        answers
+    }
+
+    /// Read the demotion and convergence flags from the top SCC's iteration state.
+    ///
+    /// Returns `(demoted, has_changed)`. Panics if the top SCC is not iterating.
+    #[allow(dead_code)]
+    fn read_iteration_outcome(&self) -> (bool, bool) {
+        let scc_stack = self.scc_stack.borrow();
+        let top_scc = scc_stack.last().expect("no SCC on the stack");
+        let iter_state = top_scc
+            .iterative
+            .as_ref()
+            .expect("top SCC is not iterating");
+        (iter_state.demoted, iter_state.has_changed)
+    }
+
+    /// Push an SCC onto the SCC stack.
+    ///
+    /// Used by the iteration driver between iterations: the SCC is popped,
+    /// mutated (iteration state updated), and pushed back for the next
+    /// iteration.
+    fn push_scc(&self, scc: Scc) {
+        self.scc_stack.borrow_mut().push(scc);
+    }
+
+    /// Pop the top SCC from the SCC stack and return it.
+    ///
+    /// Used by the iteration driver between iterations to extract the SCC
+    /// for mutation before pushing it back with updated iteration state.
+    ///
+    /// Panics if the SCC stack is empty.
+    fn pop_scc(&self) -> Scc {
+        self.scc_stack
+            .borrow_mut()
+            .pop()
+            .expect("pop_scc: SCC stack is empty")
+    }
+
+    /// Return the `detected_at` of the top SCC on the stack.
+    ///
+    /// Used by the iteration driver for absorption detection: if the top
+    /// SCC's `detected_at` changed, this SCC was merged into an ancestor.
+    ///
+    /// Panics if the SCC stack is empty.
+    fn top_scc_detected_at(&self) -> CalcId {
+        self.scc_stack
+            .borrow()
+            .last()
+            .expect("top_scc_detected_at: SCC stack is empty")
+            .detected_at
+            .dupe()
+    }
+
+    /// Returns true if any SCC below the top of the stack is iterating.
+    ///
+    /// Used by the absorption check in `iterative_resolve_scc`: when the top
+    /// SCC's `detected_at` has changed (indicating a merge), the driver can
+    /// only return early if an ancestor iteration driver exists to pick up
+    /// the merged SCC. If no ancestor is iterating, the current driver must
+    /// continue with the merged SCC to avoid orphaning it.
+    fn has_ancestor_iterating_scc(&self) -> bool {
+        let scc_stack = self.scc_stack.borrow();
+        // Skip the last element (the top SCC) and check the rest.
+        let len = scc_stack.len();
+        if len < 2 {
+            return false;
+        }
+        scc_stack[..len - 1]
+            .iter()
+            .any(|scc| scc.iterative.is_some())
+    }
+
+    /// Returns true if the SCC stack has no entries.
+    fn scc_stack_is_empty(&self) -> bool {
+        self.scc_stack.borrow().is_empty()
+    }
+
+    /// Returns true if the top SCC's `node_state` contains the given CalcId.
+    /// Returns false if the stack is empty (callers should guard with
+    /// `scc_stack_is_empty` first).
+    ///
+    /// Used after nested absorption to distinguish two cases:
+    /// - Our SCC was merged into the top SCC (detected_at changed, but our
+    ///   members are in the top SCC's node_state) → continue driving.
+    /// - Our SCC was committed by a nested driver, and a pre-existing,
+    ///   possibly non-iterating SCC (e.g. a Phase 0 SCC that was below us
+    ///   on the stack) is now the top → return.
+    ///
+    /// This works because `detected_at` is always a member of the SCC's
+    /// `node_state`, and merges union the `node_state` maps. Within a single
+    /// thread's `scc_stack`, SCCs are disjoint (overlapping membership
+    /// triggers a merge), so an unrelated SCC will not contain our CalcId.
+    fn top_scc_contains_member(&self, calc_id: &CalcId) -> bool {
+        self.scc_stack
+            .borrow()
+            .last()
+            .map(|scc| scc.node_state.contains_key(calc_id))
+            .unwrap_or(false)
+    }
+
+    /// Returns true if the top SCC's iteration state has `merge_happened` set.
+    ///
+    /// Used by `drive_all_iteration_members` to detect whether a merge occurred
+    /// during the drive loop, so it can defer demotion until after the loop.
+    fn top_scc_merge_happened(&self) -> bool {
+        let scc_stack = self.scc_stack.borrow();
+        scc_stack
+            .last()
+            .and_then(|scc| scc.iterative.as_ref())
+            .is_some_and(|iter_state| iter_state.merge_happened)
+    }
+
+    /// Set the `demoted` flag on the top SCC's iteration state.
+    ///
+    /// Used by `drive_all_iteration_members` to defer demotion: if a merge
+    /// occurred during the drive loop, the demotion is applied after the loop
+    /// completes rather than mid-loop (which would cause re-driving of
+    /// already-done members).
+    fn set_top_scc_demoted(&self, demoted: bool) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        if let Some(scc) = scc_stack.last_mut()
+            && let Some(ref mut iter_state) = scc.iterative
+        {
+            iter_state.demoted = demoted;
+        }
+    }
+
+    /// Removes a CalcId from the top SCC's `iterative.node_states`.
+    ///
+    /// Used when `drive_member` was a no-op (e.g., the target module's
+    /// Answers were evicted by another thread). Removing the member from
+    /// iteration state prevents `next_fresh_member` from returning it
+    /// again, breaking what would otherwise be an infinite loop.
+    ///
+    /// The member remains in `node_state` (legacy SCC membership). If a
+    /// merge or iteration restart rebuilds `iterative.node_states` from
+    /// `node_state.keys()`, the member is re-added as Fresh and
+    /// re-detected on the next drive loop (which is harmless — the
+    /// eviction is persistent, so the member is immediately removed again).
+    fn remove_from_iteration_state(&self, calc_id: &CalcId) {
+        let mut scc_stack = self.scc_stack.borrow_mut();
+        if let Some(scc) = scc_stack.last_mut()
+            && let Some(ref mut iter_state) = scc.iterative
+        {
+            iter_state.node_states.remove(calc_id);
+        }
     }
 }
 
@@ -836,6 +1517,113 @@ enum BindingAction<T> {
     /// Type-erased; will be downcast to `Arc<K::Answer>` in `get_idx`.
     /// Action: downcast and return
     SccLocalAnswer(Arc<dyn Any + Send + Sync>),
+    /// An iterating SCC member is InProgress with no placeholder and no
+    /// previous answer (cold-start back-edge). Two-step protocol: `push`
+    /// returns this because it lacks `K: Solve`; the caller (`get_idx`)
+    /// allocates the placeholder via `K::create_recursive`, stores it in
+    /// iteration state, and returns `K::promote_recursive`.
+    NeedsColdPlaceholder,
+}
+
+/// Per-SCC iteration state for iterative fixpoint solving.
+///
+/// This tracks the current iteration number, per-node progress within the
+/// iteration, warm-start answers from the previous iteration, and flags
+/// for demotion (membership expansion) and convergence (answer stability).
+///
+/// Iteration state is SCC-scoped so that disjoint SCCs can iterate
+/// independently.
+#[derive(Debug, Clone)]
+pub struct SccIterationState {
+    /// Current iteration number (starts at 1).
+    pub iteration: u32,
+    /// Per-node iteration tracking. Membership is `node_states.keys()`.
+    pub node_states: BTreeMap<CalcId, IterationNodeState>,
+    /// Answers from the prior iteration, used for warm-start on back-edges.
+    /// Empty on iteration 1 (cold start).
+    pub previous_answers: BTreeMap<CalcId, Arc<dyn Any + Send + Sync>>,
+    /// Whether SCC membership expanded during this iteration (requires
+    /// restarting at iteration 1 with fresh state).
+    pub demoted: bool,
+    /// Whether any answer changed compared to `previous_answers` during
+    /// this iteration. When `false` after iteration >= 2, the SCC has
+    /// converged.
+    pub has_changed: bool,
+    /// Whether an SCC merge occurred during the current drive loop.
+    /// When set, `drive_all_iteration_members` defers demotion until after
+    /// the loop completes, ensuring each member is visited at most once
+    /// per iteration regardless of how many merges occur.
+    pub merge_happened: bool,
+}
+
+/// Tracks the state of a node within a single iteration of iterative SCC solving.
+///
+/// This is separate from the legacy `NodeState` used during Phase 0 discovery.
+/// State transitions within one iteration:
+/// - `Fresh` -> `InProgress` (when we start solving this node)
+/// - `InProgress` -> `Done` (when the node's calculation completes)
+///
+/// The `placeholder` in `InProgress` is set when a cold-start back-edge
+/// allocates a recursive variable for cycle breaking.
+#[derive(Debug, Clone)]
+pub enum IterationNodeState {
+    /// Not yet processed in this iteration.
+    Fresh,
+    /// Currently being solved; may have a placeholder for cycle breaking.
+    InProgress {
+        /// Placeholder variable allocated for cold-start cycle breaking.
+        /// `None` until a back-edge triggers `NeedsColdPlaceholder`.
+        placeholder: Option<Var>,
+    },
+    /// Solved in this iteration. Stores the type-erased answer and errors.
+    Done {
+        /// The computed answer for this node in this iteration.
+        answer: Arc<dyn Any + Send + Sync>,
+        /// Errors collected during this iteration. None for cold-start.
+        errors: Option<Arc<ErrorCollector>>,
+    },
+}
+
+/// Lightweight summary of an `IterationNodeState` for borrow-safe read-then-act
+/// patterns.
+///
+/// Reading the full `IterationNodeState` requires borrowing the SCC, but we
+/// often need to drop that borrow before mutating. This enum captures just
+/// enough information to decide what action to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationNodeStateKind {
+    /// Node has not been processed yet in this iteration.
+    Fresh,
+    /// Node is in progress and a previous answer is available for warm-start.
+    InProgressWithPreviousAnswer,
+    /// Node is in progress and a placeholder variable exists for cycle breaking.
+    InProgressWithPlaceholder,
+    /// Node is in progress with neither a previous answer nor a placeholder
+    /// (cold start, first encounter).
+    InProgressCold,
+    /// Node has been solved in this iteration.
+    Done,
+}
+
+impl IterationNodeState {
+    /// Compute the lightweight summary kind from this state plus whether a
+    /// previous answer exists for the same node.
+    pub fn kind(&self, has_previous_answer: bool) -> IterationNodeStateKind {
+        match self {
+            IterationNodeState::Fresh => IterationNodeStateKind::Fresh,
+            IterationNodeState::InProgress {
+                placeholder: Some(_),
+            } => IterationNodeStateKind::InProgressWithPlaceholder,
+            IterationNodeState::InProgress { placeholder: None } => {
+                if has_previous_answer {
+                    IterationNodeStateKind::InProgressWithPreviousAnswer
+                } else {
+                    IterationNodeStateKind::InProgressCold
+                }
+            }
+            IterationNodeState::Done { .. } => IterationNodeStateKind::Done,
+        }
+    }
 }
 
 /// Represent an SCC (Strongly Connected Component) we are currently solving.
@@ -872,6 +1660,10 @@ pub struct Scc {
     /// This is the count of stack frames that belong to this SCC.
     /// Initially the cycle size; grows on merge.
     segment_size: usize,
+    /// Iteration state for iterative fixpoint solving.
+    /// `None` during Phase 0 discovery (legacy SCC tracking).
+    /// `Some(...)` when the SCC is being iteratively solved.
+    iterative: Option<SccIterationState>,
 }
 
 impl Display for Scc {
@@ -917,6 +1709,7 @@ impl Scc {
             detected_at,
             anchor_pos,
             segment_size,
+            iterative: None,
         }
     }
 
@@ -1037,6 +1830,16 @@ impl Scc {
 
     /// Merge two SCCs into one, preserving all break points and taking the
     /// most advanced state for each participant.
+    ///
+    /// If either SCC has iteration state (`iterative: Some(...)`), the merged
+    /// SCC preserves existing iteration node states (Done/InProgress) from both
+    /// sources and adds new members as Fresh. The `merge_happened` flag is set
+    /// so that `drive_all_iteration_members` can defer demotion until after the
+    /// current drive loop completes (bounding per-iteration work to O(N)).
+    /// The members of the merged iteration state come from the already-merged
+    /// `node_state.keys()` (the legacy SCC membership), which is the union of
+    /// both SCCs' members. This is important because a non-iterating SCC has
+    /// `iterative: None` but still has members in `node_state`.
     #[allow(clippy::mutable_key_type)]
     fn merge(mut self, other: Scc) -> Self {
         // Union break_at sets
@@ -1059,6 +1862,72 @@ impl Scc {
         // Note: segment_size is NOT updated here. After a merge, everything from
         // the merged anchor to the current stack top is part of this single SCC.
         // The caller must recompute segment_size = stack.len() - anchor_pos.
+
+        // Merge iteration state: if either SCC is iterating, preserve existing
+        // iteration node states (Done/InProgress) and only add new members as
+        // Fresh. Set merge_happened so the drive loop defers demotion until
+        // after the current iteration completes, bounding per-iteration work
+        // to O(N) regardless of how many merges occur.
+        self.iterative = match (self.iterative.take(), other.iterative) {
+            (None, None) => None,
+            (self_iter, other_iter) => {
+                // At least one SCC is iterating. Build merged iteration state
+                // preserving existing node states from both sources.
+                let mut merged_node_states: BTreeMap<CalcId, IterationNodeState> = BTreeMap::new();
+
+                // Collect existing iteration states from both SCCs.
+                if let Some(ref si) = self_iter {
+                    for (k, v) in &si.node_states {
+                        merged_node_states.insert(k.dupe(), v.clone());
+                    }
+                }
+                if let Some(ref oi) = other_iter {
+                    for (k, v) in &oi.node_states {
+                        // If already present from self, keep self's state (it
+                        // may be more advanced). Only insert if absent.
+                        merged_node_states
+                            .entry(k.dupe())
+                            .or_insert_with(|| v.clone());
+                    }
+                }
+
+                // Add any members from the merged node_state map that aren't
+                // yet in the iteration states (e.g. nodes from a non-iterating
+                // SCC or free-floating nodes). These are new → Fresh.
+                for key in self.node_state.keys() {
+                    merged_node_states
+                        .entry(key.dupe())
+                        .or_insert(IterationNodeState::Fresh);
+                }
+
+                // Use the max iteration from either SCC: if one has progressed
+                // further, we should not regress to iteration 1.
+                let iteration = [self_iter.as_ref(), other_iter.as_ref()]
+                    .iter()
+                    .filter_map(|opt| opt.map(|s| s.iteration))
+                    .max()
+                    .unwrap_or(1);
+                // Union previous_answers from both SCCs. Start with other's
+                // answers, then extend with self's (self is the older/lower SCC
+                // so its answers take priority on overlap).
+                let mut previous_answers = other_iter
+                    .as_ref()
+                    .map(|s| s.previous_answers.clone())
+                    .unwrap_or_default();
+                if let Some(self_s) = self_iter {
+                    previous_answers.extend(self_s.previous_answers);
+                }
+                Some(SccIterationState {
+                    iteration,
+                    node_states: merged_node_states,
+                    previous_answers,
+                    demoted: false,
+                    has_changed: false,
+                    merge_happened: true,
+                })
+            }
+        };
+
         self
     }
 
@@ -1075,6 +1944,60 @@ impl Scc {
             result.detected_at = detected_at;
         }
         result
+    }
+
+    /// Extract done answers from the current iteration state.
+    ///
+    /// Iterates over the iteration `node_states`, collecting answers from
+    /// `Done` variants into a `BTreeMap`. Used to build `previous_answers`
+    /// for the next iteration. Returns an empty map if the SCC has no
+    /// iteration state.
+    #[allow(clippy::mutable_key_type)]
+    fn extract_done_answers(&self) -> BTreeMap<CalcId, Arc<dyn Any + Send + Sync>> {
+        let Some(iter_state) = self.iterative.as_ref() else {
+            return BTreeMap::new();
+        };
+        let mut answers = BTreeMap::new();
+        for (calc_id, state) in &iter_state.node_states {
+            if let IterationNodeState::Done { answer, .. } = state {
+                answers.insert(calc_id.dupe(), answer.clone());
+            }
+        }
+        answers
+    }
+
+    /// Set up fresh iteration state for the next iteration.
+    ///
+    /// All members from the legacy `node_state` map are reset to `Fresh`
+    /// in the iteration `node_states` map. This is called between iterations
+    /// in the pop-mutate-push cycle.
+    #[allow(clippy::mutable_key_type)]
+    fn set_fresh_iteration_state(
+        &mut self,
+        iteration: u32,
+        previous_answers: BTreeMap<CalcId, Arc<dyn Any + Send + Sync>>,
+    ) {
+        let all_members: BTreeMap<CalcId, IterationNodeState> = self
+            .node_state
+            .keys()
+            .duped()
+            .map(|k| (k, IterationNodeState::Fresh))
+            .collect();
+        self.iterative = Some(SccIterationState {
+            iteration,
+            node_states: all_members,
+            previous_answers,
+            demoted: false,
+            has_changed: false,
+            merge_happened: false,
+        });
+    }
+
+    /// Returns true if this SCC has break_at entries, indicating a true
+    /// cycle with self-loops. A singleton SCC without self-loops has an
+    /// empty break_at set and should not be iteratively solved.
+    fn has_break_at(&self) -> bool {
+        !self.break_at.is_empty()
     }
 }
 
@@ -1095,15 +2018,96 @@ pub struct ThreadState {
     debug: RefCell<bool>,
     /// Configuration for recursion depth limiting. None means disabled.
     recursion_limit_config: Option<RecursionLimitConfig>,
+    /// How SCC participants store answers during solving.
+    scc_solving_mode: SccSolvingMode,
+    /// Partial answers for inline first-use pinning, keyed by (NameAssign def_idx, CalcStack height).
+    /// The height ensures that only ForwardToFirstUse bindings at the same CalcStack depth
+    /// as the NameAssign's solve_binding can see the partial answer (offset 0 in get_idx,
+    /// which checks before pushing its own frame).
+    partial_answers: RefCell<FxHashMap<(Idx<Key>, usize), Arc<TypeInfo>>>,
+}
+
+/// Internal SCC-solving modes controlled via `PYREFLY_SCC_SOLVING_MODE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SccSolvingMode {
+    /// Write SCC participant answers to Calculation immediately.
+    #[default]
+    CyclesDualWrite,
+    /// Thread-local SCC solving with batch commits to Calculation.
+    CyclesThreadLocal,
+    /// Iterative fixpoint: re-solve SCC members until answers converge.
+    Iterative,
 }
 
 impl ThreadState {
-    pub fn new(recursion_limit_config: Option<RecursionLimitConfig>) -> Self {
+    pub fn new(recursion_limit_config: Option<RecursionLimitConfig>, scc_mode: SccMode) -> Self {
+        let scc_solving_mode = SccSolvingMode::resolve(scc_mode);
         Self {
-            stack: CalcStack::new(),
+            stack: CalcStack::new(scc_solving_mode),
             debug: RefCell::new(false),
             recursion_limit_config,
+            scc_solving_mode,
+            partial_answers: RefCell::new(FxHashMap::default()),
         }
+    }
+
+    fn scc_solving_mode(&self) -> SccSolvingMode {
+        self.scc_solving_mode
+    }
+}
+
+impl SccSolvingMode {
+    /// Resolve the SCC solving mode from a config enum, with an env var override.
+    ///
+    /// The `PYREFLY_SCC_SOLVING_MODE` env var takes precedence over the config
+    /// value, allowing runtime experimentation without config changes.
+    fn resolve(mode: SccMode) -> Self {
+        match env::var("PYREFLY_SCC_SOLVING_MODE") {
+            Ok(value) => match value.as_str() {
+                "cycles-dual-write" => Self::CyclesDualWrite,
+                "cycles-thread-local" => Self::CyclesThreadLocal,
+                "iterative-fixpoint" => Self::Iterative,
+                _ => panic!(
+                    "$PYREFLY_SCC_SOLVING_MODE must be one of \
+                     `cycles-dual-write`, `cycles-thread-local`, \
+                     or `iterative-fixpoint`, got `{value}`"
+                ),
+            },
+            Err(_) => match mode {
+                SccMode::CyclesDualWrite => Self::CyclesDualWrite,
+                SccMode::CyclesThreadLocal => Self::CyclesThreadLocal,
+                SccMode::IterativeFixpoint => Self::Iterative,
+            },
+        }
+    }
+}
+
+/// Maximum number of fixpoint iterations before the iterative SCC solver
+/// gives up and commits the last answers. Exceeding this threshold logs a
+/// warning but does not panic, since the answers may still be approximately
+/// correct.
+const MAX_ITERATIONS: u32 = 5;
+
+/// Maximum number of demotion restarts (SCC membership expansions) before
+/// the iterative SCC solver panics. Exceeding this threshold almost
+/// certainly indicates an infinite membership expansion loop rather than
+/// legitimate growth.
+const MAX_DEMOTIONS: u32 = 10;
+
+/// Check whether the demotion count has exceeded `MAX_DEMOTIONS`, and panic
+/// if so. Extracted from the `iterative_resolve_scc` loop to allow direct
+/// unit testing of the safety limit.
+///
+/// Uses `Debug` formatting for `scc_identity` rather than `Display` because
+/// `CalcId::Display` requires a populated bindings table (which panics in
+/// test contexts), while `CalcId::Debug` prints the raw index safely.
+fn check_demotion_limit(demotions: u32, scc_identity: &CalcId) {
+    if demotions > MAX_DEMOTIONS {
+        panic!(
+            "iterative_resolve_scc: SCC {:?} exceeded {} demotions; \
+             likely infinite membership expansion",
+            scc_identity, MAX_DEMOTIONS,
+        );
     }
 }
 
@@ -1121,6 +2125,38 @@ pub struct AnswersSolver<'a, Ans: LookupAnswer> {
     pub recurser: &'a VarRecurser,
     pub stdlib: &'a Stdlib,
     pub heap: &'a TypeHeap,
+    /// Cache for jaxtyping dimension name → Quantified type mappings.
+    /// Module-scoped: the same dimension name always maps to the same Quantified,
+    /// which is correct because each function independently wraps its signature
+    /// in a Forall (just like legacy TypeVars defined at module scope).
+    jaxtyping_dims: RefCell<FxHashMap<Name, Quantified>>,
+}
+
+/// RAII guard that releases write locks on panic during SCC batch commit.
+///
+/// Holds a list of `CalcId`s whose Calculation cells have been write-locked.
+/// On drop (panic), calls `write_unlock_empty` on each to release the locks
+/// without writing values, preventing deadlocks. On success, call `disarm()`
+/// to clear the list so `drop` is a no-op.
+struct SccWriteLockGuard<'a, 'b, Ans: LookupAnswer> {
+    solver: &'a AnswersSolver<'b, Ans>,
+    locked: Vec<CalcId>,
+}
+
+impl<Ans: LookupAnswer> Drop for SccWriteLockGuard<'_, '_, Ans> {
+    fn drop(&mut self) {
+        for calc_id in &self.locked {
+            self.solver.write_unlock_empty_single(calc_id);
+        }
+    }
+}
+
+impl<Ans: LookupAnswer> SccWriteLockGuard<'_, '_, Ans> {
+    /// Disarm the guard after a successful commit. Clears the locked list
+    /// so `drop` does nothing.
+    fn disarm(mut self) {
+        self.locked.clear();
+    }
 }
 
 impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
@@ -1147,6 +2183,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             current,
             thread_state,
             heap,
+            jaxtyping_dims: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -1159,6 +2196,34 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     #[allow(dead_code)]
     pub fn set_debug(&self, value: bool) {
         *self.thread_state.debug.borrow_mut() = value;
+    }
+
+    /// Get or create a Quantified type for a jaxtyping dimension name.
+    /// Cached per module: the same name always returns the same Quantified.
+    pub fn get_or_create_jaxtyping_dim(&self, name: Name, kind: QuantifiedKind) -> Quantified {
+        let mut dims = self.jaxtyping_dims.borrow_mut();
+        dims.entry(name.clone())
+            .or_insert_with(|| match kind {
+                QuantifiedKind::TypeVar => Quantified::type_var(
+                    name,
+                    self.uniques.fresh(),
+                    None,
+                    Restriction::Unrestricted,
+                    PreInferenceVariance::Invariant,
+                ),
+                QuantifiedKind::TypeVarTuple => {
+                    Quantified::type_var_tuple(name, self.uniques.fresh(), None)
+                }
+                QuantifiedKind::ParamSpec => {
+                    unreachable!("jaxtyping dimensions cannot be ParamSpec")
+                }
+            })
+            .clone()
+    }
+
+    /// Check if a Quantified type was created by jaxtyping dimension parsing.
+    pub fn is_jaxtyping_dim(&self, q: &Quantified) -> bool {
+        self.jaxtyping_dims.borrow().values().any(|v| v == q)
     }
 
     pub fn current(&self) -> &Answers {
@@ -1179,6 +2244,55 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
 
     pub fn stack(&self) -> &CalcStack {
         &self.thread_state.stack
+    }
+
+    /// Store a partial answer for inline first-use pinning.
+    /// `def_idx` is the Key::Definition idx of the NameAssign.
+    /// Keyed by (def_idx, current CalcStack height).
+    pub(crate) fn store_partial_answer(&self, def_idx: Idx<Key>, type_info: Arc<TypeInfo>) {
+        let height = self.stack().len();
+        self.thread_state
+            .partial_answers
+            .borrow_mut()
+            .insert((def_idx, height), type_info);
+    }
+
+    /// Remove the partial answer for a NameAssign at the current height.
+    pub(crate) fn clear_partial_answer(&self, def_idx: Idx<Key>) {
+        let height = self.stack().len();
+        self.thread_state
+            .partial_answers
+            .borrow_mut()
+            .remove(&(def_idx, height));
+    }
+
+    /// Check for a matching partial answer at the current CalcStack height.
+    ///
+    /// The height check ensures that only a ForwardToFirstUse resolved at the same
+    /// CalcStack depth as the NameAssign's solve_binding can see the partial answer.
+    /// This is offset 0 because the check runs in `get_idx` BEFORE pushing the
+    /// ForwardToFirstUse's own frame. Bindings at deeper heights (e.g., a ClassField
+    /// that indirectly depends on the same variable) correctly miss the partial answer
+    /// and go through normal resolution.
+    pub(crate) fn check_partial_answer(&self, def_idx: Idx<Key>) -> Option<Arc<TypeInfo>> {
+        let height = self.stack().len();
+        self.thread_state
+            .partial_answers
+            .borrow()
+            .get(&(def_idx, height))
+            .cloned()
+    }
+
+    /// Given the target idx of a ForwardToFirstUse binding, find the NameAssign's
+    /// def_idx for partial answer lookup.
+    ///
+    /// ForwardToFirstUse always points to a NameAssign with `def_idx.is_some()`.
+    pub(crate) fn def_idx_for_forward_to_first_use(&self, target: Idx<Key>) -> Option<Idx<Key>> {
+        let binding = self.bindings().get(target);
+        match binding {
+            Binding::NameAssign(na) if na.def_idx.is_some() => Some(target),
+            _ => None,
+        }
     }
 
     fn recursion_limit_config(&self) -> Option<RecursionLimitConfig> {
@@ -1209,6 +2323,15 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
+        // Check for a partial answer shortcut before pushing to the CalcStack.
+        // This is used by ForwardToFirstUse during inline first-use pinning to
+        // return the raw type without caching it in shared Answers and without
+        // triggering cycle detection against the NameAssign's CalcStack frame.
+        let binding = self.bindings().get(idx);
+        if let Some(answer) = K::check_shortcut(self, binding) {
+            return answer;
+        }
+
         let current = CalcId(self.bindings().dupe(), K::to_anyidx(idx));
         let calculation = self.get_calculation(idx);
 
@@ -1220,7 +2343,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             return result;
         }
 
-        let result = match self.stack().push(current.dupe(), calculation) {
+        let mut result = match self.stack().push(current.dupe(), calculation) {
             BindingAction::Calculate => self.calculate_and_record_answer(current, idx, calculation),
             BindingAction::Unwind => self
                 .attempt_to_unwind_cycle_from_here(&current, idx, calculation)
@@ -1238,9 +2361,38 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         .expect("SccLocalAnswer downcast failed: type mismatch"),
                 )
             }
+            BindingAction::NeedsColdPlaceholder => {
+                // Two-step protocol: push() returned NeedsColdPlaceholder because
+                // it lacks K: Solve. We allocate the placeholder here, store it
+                // in iteration state so subsequent back-edges return CycleBroken,
+                // and return the promoted value.
+                let binding = self.bindings().get(idx);
+                let var = K::create_recursive(self, binding);
+                self.stack().set_iteration_placeholder(&current, var);
+                Arc::new(K::promote_recursive(self.heap, var))
+            }
         };
         for scc in self.stack().pop_and_drain_completed_sccs() {
-            self.batch_commit_scc(scc);
+            if self.stack().is_iterative() && scc.has_break_at() {
+                // True cycle in iterative mode: run the iterative fixpoint
+                // driver instead of the one-shot batch commit.
+                self.iterative_resolve_scc(scc);
+            } else {
+                // Legacy mode or singleton without self-loop: commit directly.
+                self.batch_commit_scc(scc);
+            }
+        }
+        // After SCC iteration, the Calculation cell may hold a newer answer
+        // than what `calculate_and_record_answer` returned. This happens when
+        // the current CalcId is an SCC member: in iterative mode, the answer
+        // is stored in SCC-local NodeState::Done (not in the Calculation cell)
+        // and `calculate_and_record_answer` returns the first-iteration answer.
+        // After `iterative_resolve_scc` commits the final iterated answer to
+        // the Calculation cell, we must re-read it so that callers (like
+        // KeyExport nodes that depend on SCC members) see the SCC's final
+        // answer rather than the stale pre-iteration answer.
+        if let Some(v) = calculation.get() {
+            result = v;
         }
         result
     }
@@ -1251,6 +2403,17 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     /// For SCC participants, the answer is stored in `NodeState::Done` and will be
     /// batch-committed to the `Calculation` cell when the entire SCC completes.
     /// For non-SCC nodes, the answer is written directly to `Calculation` as before.
+    ///
+    /// In iterative mode, if the current CalcId is a member of the top SCC's
+    /// iteration state, we use a separate iterative path that:
+    /// - Suppresses errors during cold-start (iteration 1) and collects them
+    ///   from iteration 2 onward.
+    /// - Deep-forces the answer to avoid Var-ID inequality in convergence
+    ///   comparisons.
+    /// - Finalizes any placeholder created for this node.
+    /// - Compares to the previous iteration's answer to track convergence.
+    /// - Stores the answer in SCC-local iteration state (not in Calculation)
+    ///   until the final commit.
     ///
     /// Completed SCCs are pushed to the `pending_completed_sccs` buffer
     /// inside `on_calculation_finished`; `get_idx` drains them after the
@@ -1265,11 +2428,19 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
+        // Iterative path: when iterative mode is active and the current CalcId
+        // is in the top SCC's iteration state, use the iterative code path
+        // instead of the legacy SCC or non-SCC paths.
+        if self.stack().is_iterative() && self.stack().get_iteration_node_state(&current).is_some()
+        {
+            return self.calculate_and_record_answer_iterative(current, idx);
+        }
+
         let binding = self.bindings().get(idx);
         // Note that we intentionally do not pass in the key when solving the binding,
         // as the result of a binding should not depend on the key it was bound to.
         // We use the range for error reporting.
-        let range = self.bindings().idx_to_key(idx).range();
+        let range = K::range_with(idx, self.bindings());
 
         let local_errors = self.error_collector();
         let raw_answer = K::solve(self, binding, range, &local_errors);
@@ -1287,7 +2458,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         };
 
         if self.stack().is_scc_participant(&current) {
-            // SCC path: store in NodeState::Done, defer Calculation write to batch commit.
+            // SCC path: store in NodeState::Done and (optionally) write to Calculation.
             //
             // If this is a break_at node (has a placeholder Var), we must finalize
             // the recursive answer now, before storing. Finalization mutates solver
@@ -1297,12 +2468,29 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             } else {
                 raw_answer
             };
-            let answer_erased: Arc<dyn Any + Send + Sync> = Arc::new(answer.dupe());
-            let canonical_erased = self.stack().on_calculation_finished(
-                &current,
-                Some(answer_erased),
-                Some(Arc::new(local_errors)),
-            );
+            let (calc_answer, errors) =
+                if self.thread_state.scc_solving_mode() == SccSolvingMode::CyclesDualWrite {
+                    // Write to Calculation immediately for cross-thread visibility.
+                    // Without this, the Calculation stays in Calculating status during
+                    // SCC processing, allowing other threads to independently re-compute
+                    // this binding via propose_calculation() → Calculatable. Since
+                    // cycle-oriented solving is not entrypoint-invariant, independent
+                    // re-computation can produce different results depending on thread
+                    // scheduling, causing non-determinism.
+                    let (calc_answer, did_write) = calculation.record_value(answer.dupe());
+                    if did_write {
+                        self.base_errors.extend(local_errors);
+                    }
+                    (calc_answer, None)
+                } else {
+                    (answer, Some(Arc::new(local_errors)))
+                };
+            // Also store in NodeState::Done for SCC-local isolation (the SCC
+            // uses these answers via SccLocalAnswer without touching Calculation).
+            let answer_erased: Arc<dyn Any + Send + Sync> = Arc::new(calc_answer.dupe());
+            let canonical_erased =
+                self.stack()
+                    .on_calculation_finished(&current, Some(answer_erased), errors);
             // Use the canonical answer from thread-local state, mirroring how
             // Calculation::record_value returns the first-written answer.
             match canonical_erased {
@@ -1311,7 +2499,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         .downcast::<Arc<K::Answer>>()
                         .expect("on_calculation_finished canonical answer downcast failed"),
                 ),
-                None => answer,
+                None => calc_answer,
             }
         } else {
             // Non-SCC path: write directly to Calculation as before.
@@ -1326,96 +2514,642 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         }
     }
 
-    /// Commit a type-erased answer to the Calculation cell for a same-module binding.
-    /// Used during batch commit when an SCC completes.
+    /// Iterative path for `calculate_and_record_answer`.
     ///
-    /// The answer was already finalized (force_var called) during calculate_and_record_answer,
-    /// so we use a no-op finalizer here. Errors are only extended into base_errors if
-    /// this thread's write wins (did_write = true).
-    fn commit_typed<K: Solve<Ans>>(
+    /// Called when the current CalcId is a member of the top SCC's iteration
+    /// state. Unlike the legacy path, this:
+    /// - During cold-start iteration 1, bypasses `LoopPhi` bindings by
+    ///   resolving only the prior/default index. This prevents LoopPhi from
+    ///   creating its own `LoopRecursive` placeholder, which would conflict
+    ///   with the iterative placeholder system.
+    /// - Uses `error_swallower()` during cold-start (iteration 1) because
+    ///   cold-start answers are based on placeholders and produce spurious
+    ///   errors. From iteration 2 onward, uses `error_collector()` to capture
+    ///   errors that will be committed if this is the final iteration.
+    /// - Deep-forces the answer before storage to avoid Var-ID inequality
+    ///   in convergence comparisons.
+    /// - Finalizes any placeholder created for this node during cycle breaking.
+    /// - Compares the answer to `previous_answers` via `answers_equal` and
+    ///   calls `mark_iteration_changed` if they differ.
+    /// - Stores the answer in `IterationNodeState::Done` (SCC-local), NOT in
+    ///   `Calculation`. The answer is only committed to `Calculation` when
+    ///   the iteration driver commits the final converged answers.
+    fn calculate_and_record_answer_iterative<K: Solve<Ans>>(
+        &self,
+        current: CalcId,
+        idx: Idx<K>,
+    ) -> Arc<K::Answer>
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        // LoopPhi cold-start bypass: during iteration 1, LoopPhi's normal
+        // solve path would resolve loop-body branches, hit cycle breaks, and
+        // create its own LoopRecursive placeholder. That conflicts with the
+        // iterative placeholder system. Instead, resolve only the prior/default
+        // value (the value from before the loop body) and use it as the answer.
+        // On warm-start iterations (>= 2), LoopPhi goes through the normal
+        // path and gets the previous iteration's answer via the iterative
+        // bypass, which converges correctly.
+        if self.stack().is_cold_iteration()
+            && let AnyIdx::Key(key_idx) = current.1
+        {
+            // Use explicit Key type parameter because `key_idx` is `Idx<Key>`
+            // (from the AnyIdx::Key match), not `Idx<K>`. The function is
+            // generic over K, but we know K = Key here; Rust's type system
+            // requires the concrete type to resolve the binding table lookup.
+            let key_binding = self.bindings().get::<Key>(key_idx);
+            if let Binding::LoopPhi(prior_idx, _) = key_binding {
+                // Resolve the prior/default index (value from above the loop).
+                // Uses get_idx::<Key> explicitly since prior_idx is Idx<Key>.
+                let prior_answer: Arc<TypeInfo> = self.get_idx::<Key>(*prior_idx);
+
+                // Deep-force to resolve all type variables, matching the
+                // invariant that all iterative answers are deep-forced.
+                let mut forced = Arc::unwrap_or_clone(prior_answer);
+                forced.visit_mut(&mut |x| self.current.solver().deep_force_mut(x));
+                let answer = Arc::new(forced);
+
+                // Type-erase for storage. The concrete type inside the outer
+                // Arc<dyn Any> is Arc<TypeInfo> (= Arc<Key::Answer>).
+                let answer_erased: Arc<dyn Any + Send + Sync> = Arc::new(answer.dupe());
+
+                // Cold start has no previous answer; always mark changed so
+                // iteration 1 never appears converged.
+                self.stack().mark_iteration_changed();
+
+                // Store as Done in iteration state. Errors are None because
+                // this is cold-start iteration 1 (errors are swallowed).
+                self.stack()
+                    .set_iteration_node_done(&current, answer_erased.clone(), None);
+
+                // Downcast back to Arc<K::Answer>. This code path only
+                // executes when K = Key (guarded by AnyIdx::Key match), so
+                // K::Answer = TypeInfo and the downcast always succeeds.
+                return Arc::unwrap_or_clone(
+                    answer_erased
+                        .downcast::<Arc<K::Answer>>()
+                        .expect("LoopPhi bypass: K must be Key when AnyIdx::Key matches"),
+                );
+            }
+        }
+
+        let binding = self.bindings().get(idx);
+        let range = K::range_with(idx, self.bindings());
+
+        // Error handling strategy:
+        // - Iteration 1 (cold): suppress all errors because cold-start answers
+        //   (from placeholders) produce spurious diagnostics.
+        // - Iteration >= 2: collect errors normally. Only the final iteration's
+        //   errors are committed.
+        let local_errors = if self.stack().is_cold_iteration() {
+            self.error_swallower()
+        } else {
+            self.error_collector()
+        };
+        let raw_answer = K::solve(self, binding, range, &local_errors);
+
+        // If a placeholder was created for this node during cycle breaking,
+        // finalize the recursive answer (unify the placeholder with the actual
+        // answer via record_recursive + force_var). This must happen BEFORE
+        // deep-forcing: finalization sets the placeholder Var's answer in the
+        // solver, so a subsequent deep-force correctly resolves it. Reversing
+        // the order would leave the placeholder Var unresolved during forcing.
+        let answer = if let Some(var) = self.stack().get_iteration_placeholder(&current) {
+            self.finalize_recursive_answer::<K>(idx, var, raw_answer, &local_errors)
+        } else {
+            raw_answer
+        };
+
+        // Deep-force the answer to resolve all type variables. This is required
+        // for convergence comparisons: without forcing, structurally identical
+        // answers can appear different due to unresolved Var IDs.
+        let mut forced = Arc::unwrap_or_clone(answer);
+        forced.visit_mut(&mut |x| self.current.solver().deep_force_mut(x));
+        let answer = Arc::new(forced);
+
+        // Type-erase the answer for storage in iteration state.
+        // Wrap in Arc::new() so the concrete type inside Arc<dyn Any> is
+        // Arc<K::Answer>, matching downcasts in answers_equal_typed and
+        // SccLocalAnswer handling.
+        let answer_erased: Arc<dyn Any + Send + Sync> = Arc::new(answer.dupe());
+
+        // Compare to the previous iteration's answer (if any) to detect
+        // convergence. If the answer has changed, the fixpoint has not yet
+        // converged and the iteration driver must run another iteration.
+        if let Some(previous) = self.stack().get_previous_answer(&current) {
+            if !self.answers_equal(&current.1, &previous, &answer_erased) {
+                self.stack().mark_iteration_changed();
+            }
+        } else {
+            // No previous answer (cold start): always mark changed so that
+            // iteration 1 never appears converged.
+            self.stack().mark_iteration_changed();
+        }
+
+        // Store in IterationNodeState::Done. Do NOT write to Calculation;
+        // that happens only when the iteration driver commits final answers.
+        let errors = if self.stack().is_cold_iteration() {
+            None
+        } else {
+            Some(Arc::new(local_errors))
+        };
+        self.stack()
+            .set_iteration_node_done(&current, answer_erased, errors);
+
+        answer
+    }
+
+    /// Returns true if the cell is same-module.
+    fn is_same_module(&self, calc_id: &CalcId) -> bool {
+        let CalcId(ref bindings, _) = *calc_id;
+        bindings.module().name() == self.bindings().module().name()
+            && bindings.module().path() == self.bindings().module().path()
+    }
+
+    /// Acquire a write lock on a single Calculation cell.
+    /// Routes to same-module or cross-module depending on the CalcId.
+    fn write_lock_single(&self, calc_id: &CalcId) -> bool {
+        let CalcId(_, ref any_idx) = *calc_id;
+        if self.is_same_module(calc_id) {
+            dispatch_anyidx!(any_idx, self, write_lock_same_module)
+        } else {
+            self.answers.write_lock_in_module(calc_id)
+        }
+    }
+
+    /// Same-module write lock: acquire the write lock on a typed Calculation cell.
+    fn write_lock_same_module<K: Solve<Ans>>(&self, idx: Idx<K>) -> bool
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        self.get_calculation(idx).write_lock()
+    }
+
+    /// Write a value to a write-locked cell and release the lock, with error handling.
+    /// Routes to same-module or cross-module depending on the CalcId.
+    fn write_unlock_single(
+        &self,
+        calc_id: CalcId,
+        answer: Arc<dyn Any + Send + Sync>,
+        errors: Option<Arc<ErrorCollector>>,
+    ) -> bool {
+        let CalcId(ref bindings, ref any_idx) = calc_id;
+        if bindings.module().name() == self.bindings().module().name()
+            && bindings.module().path() == self.bindings().module().path()
+        {
+            dispatch_anyidx!(any_idx, self, write_unlock_same_module, answer, errors)
+        } else {
+            self.answers.write_unlock_in_module(calc_id, answer, errors)
+        }
+    }
+
+    /// Same-module write unlock: write the answer and handle errors.
+    fn write_unlock_same_module<K: Solve<Ans>>(
         &self,
         idx: Idx<K>,
         answer: Arc<dyn Any + Send + Sync>,
         errors: Option<Arc<ErrorCollector>>,
-    ) where
+    ) -> bool
+    where
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
         let typed_answer: Arc<K::Answer> = Arc::unwrap_or_clone(
             answer
                 .downcast::<Arc<K::Answer>>()
-                .expect("commit_typed: type mismatch in batch commit"),
+                .expect("write_unlock_same_module: type mismatch in batch commit"),
         );
         let calculation = self.get_calculation(idx);
-        // No recursive placeholder can exist in the Calculation cell because
-        // placeholders are stored only in SCC-local NodeState::HasPlaceholder.
-        // The answer was already finalized (force_var called) during
-        // calculate_and_record_answer's SCC path.
-        let (_answer, did_write) = calculation.record_value(typed_answer);
+        let (_answer, did_write) = calculation.write_unlock(typed_answer);
         if did_write && let Some(errors) = errors {
-            // ErrorCollector::extend takes ownership. Arc::try_unwrap succeeds
-            // because the Arc refcount is 1: the ErrorCollector is moved (not
-            // cloned) at every step from creation through NodeState::Done, SCC
-            // completion, and into this consuming iteration. (Scc::merge may
-            // transiently clone a NodeState, but the original is dropped
-            // immediately, so the refcount returns to 1 before we get here.)
             let errors = Arc::try_unwrap(errors).expect(
-                "Arc<ErrorCollector> refcount > 1 during batch commit; \
-                 errors would be silently lost. This indicates a bug in SCC lifecycle management.",
+                "Arc<ErrorCollector> refcount > 1 during write_unlock; \
+                 errors would be silently lost.",
             );
             self.base_errors.extend(errors);
         }
+        did_write
     }
 
-    /// Commit a single preliminary result from a completed SCC.
-    /// Uses dispatch_anyidx! to recover the concrete key type from AnyIdx,
-    /// then delegates to commit_typed<K> for same-module commits or
-    /// LookupAnswer::commit_to_module for cross-module commits.
-    fn commit_single_result(
-        &self,
-        calc_id: CalcId,
-        answer: Arc<dyn Any + Send + Sync>,
-        errors: Option<Arc<ErrorCollector>>,
-    ) {
-        let CalcId(ref bindings, ref any_idx) = calc_id;
-        if bindings.module().name() != self.bindings().module().name() {
-            // Cross-module: delegate to the LookupAnswer trait to route
-            // the commit to the correct module's Answers.
-            self.answers.commit_to_module(calc_id, answer, errors);
-            return;
+    /// Release a write lock without writing a value (panic cleanup).
+    /// Routes to same-module or cross-module depending on the CalcId.
+    fn write_unlock_empty_single(&self, calc_id: &CalcId) {
+        let CalcId(_, ref any_idx) = *calc_id;
+        if self.is_same_module(calc_id) {
+            dispatch_anyidx!(any_idx, self, write_unlock_empty_same_module)
+        } else {
+            self.answers.write_unlock_empty_in_module(calc_id);
         }
-        dispatch_anyidx!(any_idx, self, commit_typed, answer, errors)
     }
 
-    /// Batch-commit all preliminary answers from a completed SCC.
-    /// Iterates the SCC's node_state map and commits each Done entry
-    /// to the appropriate Calculation cell.
+    /// Same-module write unlock empty: release the lock without writing.
+    fn write_unlock_empty_same_module<K: Solve<Ans>>(&self, idx: Idx<K>)
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        self.get_calculation(idx).write_unlock_empty();
+    }
+
+    /// Two-phase batch-commit all preliminary answers from a completed SCC.
+    ///
+    /// Phase 1: Lock all member Calculation cells (in CalcId order to avoid
+    /// deadlocks between threads).
+    /// Phase 2: Write all answers via `write_unlock`.
+    ///
+    /// This ensures that when two threads independently solve the same SCC,
+    /// the first thread to start committing writes ALL its answers atomically.
+    /// The second thread's writes are all no-ops (first-write-wins).
     ///
     /// Invariant: all SCC participants should be in `Done` state at this point.
     /// Nodes with `answer: None` are skipped (they were already committed by
     /// another thread via the Participant revisit path).
     fn batch_commit_scc(&self, completed_scc: Scc) {
-        // Validate invariant: no Fresh or InProgress nodes should remain.
-        debug_assert!(
-            completed_scc.node_state.values().all(|state| matches!(
-                state,
-                NodeState::Done { .. } | NodeState::HasPlaceholder(_)
-            )),
-            "batch_commit_scc: SCC has participants that are not Done or HasPlaceholder: {:?}",
-            completed_scc
-                .node_state
-                .iter()
-                .filter(|(_, s)| matches!(s, NodeState::Fresh | NodeState::InProgress))
-                .map(|(id, s)| format!("{}: {:?}", id, s))
-                .collect::<Vec<_>>(),
-        );
+        // Collect committable members. BTreeMap iteration is already sorted
+        // by CalcId, ensuring deterministic lock acquisition order.
+        let mut members: Vec<(
+            CalcId,
+            Arc<dyn Any + Send + Sync>,
+            Option<Arc<ErrorCollector>>,
+        )> = Vec::new();
         for (calc_id, node_state) in completed_scc.node_state {
-            if let NodeState::Done {
-                answer: Some(answer),
-                errors,
-            } = node_state
-            {
-                self.commit_single_result(calc_id, answer, errors);
+            match node_state {
+                NodeState::Done {
+                    answer: Some(answer),
+                    errors,
+                } => {
+                    members.push((calc_id, answer, errors));
+                }
+                NodeState::Done { answer: None, .. } => {
+                    // Already committed by another thread via the Participant revisit path.
+                }
+                NodeState::HasPlaceholder(_) => {
+                    panic!(
+                        "batch_commit_scc: node {} is still HasPlaceholder at commit time. \
+                         This means its calculate_and_record_answer never completed, \
+                         which would leave its Calculation cell stuck in Calculating state.",
+                        calc_id,
+                    );
+                }
+                NodeState::Fresh | NodeState::InProgress => {
+                    panic!(
+                        "batch_commit_scc: node {} is {:?} at commit time",
+                        calc_id, node_state,
+                    );
+                }
+            }
+        }
+
+        // Phase 1: Lock all cells.
+        let mut guard = SccWriteLockGuard {
+            solver: self,
+            locked: Vec::new(),
+        };
+        for (calc_id, _, _) in &members {
+            if self.write_lock_single(calc_id) {
+                guard.locked.push(calc_id.dupe());
+            }
+        }
+
+        // Phase 2: Write answers to locked cells. Cells that weren't locked
+        // are already Calculated (write_lock returned false), so writing
+        // would be a no-op — skip them.
+        let mut locked_members = Vec::with_capacity(guard.locked.len());
+        for calc_id in &guard.locked {
+            locked_members.push(calc_id.dupe());
+        }
+        for (calc_id, answer, errors) in members {
+            if locked_members.contains(&calc_id) {
+                self.write_unlock_single(calc_id, answer, errors);
+            }
+        }
+        guard.disarm();
+    }
+
+    /// Commit all final converged answers from an iteratively-solved SCC
+    /// to their respective Calculation cells using two-phase commit.
+    ///
+    /// Phase 1: Lock all member Calculation cells (in CalcId order).
+    /// Phase 2: Write all answers via `write_unlock`.
+    ///
+    /// Called after the fixpoint iteration converges (or max iterations are
+    /// reached).
+    fn commit_final_answers(&self, scc: Scc) -> bool {
+        let iter_state = scc
+            .iterative
+            .expect("commit_final_answers: SCC has no iteration state");
+
+        // Collect Done members. BTreeMap iteration is already sorted by CalcId.
+        let members: Vec<(
+            CalcId,
+            Arc<dyn Any + Send + Sync>,
+            Option<Arc<ErrorCollector>>,
+        )> = iter_state
+            .node_states
+            .into_iter()
+            .map(|(calc_id, node_state)| match node_state {
+                IterationNodeState::Done { answer, errors } => (calc_id, answer, errors),
+                IterationNodeState::Fresh | IterationNodeState::InProgress { .. } => {
+                    panic!(
+                        "commit_final_answers: node {} is {:?} at commit time",
+                        calc_id, node_state,
+                    );
+                }
+            })
+            .collect();
+
+        // Phase 1: Lock all cells.
+        let mut guard = SccWriteLockGuard {
+            solver: self,
+            locked: Vec::new(),
+        };
+        for (calc_id, _, _) in &members {
+            if self.write_lock_single(calc_id) {
+                guard.locked.push(calc_id.dupe());
+            }
+        }
+
+        // Phase 2: Write answers to locked cells. Cells that weren't locked
+        // are already Calculated (write_lock returned false), so writing
+        // would be a no-op — skip them.
+        let mut locked_members = Vec::with_capacity(guard.locked.len());
+        for calc_id in &guard.locked {
+            locked_members.push(calc_id.dupe());
+        }
+        let mut did_write_any = false;
+        for (calc_id, answer, errors) in members {
+            if locked_members.contains(&calc_id) {
+                did_write_any |= self.write_unlock_single(calc_id, answer, errors);
+            }
+        }
+        guard.disarm();
+        did_write_any
+    }
+
+    /// Drive a single iteration member by calling `get_idx` for its typed index.
+    ///
+    /// The member is a `CalcId` containing `(Bindings, AnyIdx)`. For same-module
+    /// members (where the member's module matches this solver's module), we
+    /// dispatch through `dispatch_anyidx!` to call `get_idx` with the concrete
+    /// key type. Cross-module members are driven via `solve_idx_erased`, which
+    /// constructs a temporary `AnswersSolver` in the target module's context
+    /// using the shared `ThreadState` (and therefore the shared `CalcStack`).
+    fn drive_member(&self, calc_id: &CalcId) {
+        let CalcId(ref bindings, ref any_idx) = *calc_id;
+        if bindings.module().name() != self.bindings().module().name()
+            || bindings.module().path() != self.bindings().module().path()
+        {
+            // Cross-module member: drive via LookupAnswer::solve_idx_erased,
+            // which routes to the target module's Answers and constructs a
+            // temporary AnswersSolver there with the shared ThreadState.
+            assert!(
+                self.answers.solve_idx_erased(calc_id, self.thread_state),
+                "drive_member: cross-module driving failed for {}. \
+                 The target module's Answers may not be loaded.",
+                calc_id,
+            );
+            return;
+        }
+        dispatch_anyidx!(any_idx, self, drive_member_typed);
+    }
+
+    /// Type-specialized helper for `drive_member`. Calls `get_idx` for the
+    /// concrete key type, discarding the result (the answer is stored in
+    /// iteration state by `calculate_and_record_answer_iterative`).
+    fn drive_member_typed<K: Solve<Ans>>(&self, idx: Idx<K>)
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        let _ = self.get_idx(idx);
+    }
+
+    /// Type-specialized helper for `Answers::solve_idx_erased`. Calls `get_idx`
+    /// for the concrete key type, discarding the result. Used for cross-module
+    /// iterative driving where the answer is stored in iteration state on the
+    /// shared `CalcStack`.
+    pub(crate) fn solve_idx_erased_typed<K: Solve<Ans>>(&self, idx: Idx<K>)
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        let _ = self.get_idx(idx);
+    }
+
+    /// Drive all fresh iteration members in the top SCC until none remain.
+    ///
+    /// Because every back-edge breaks immediately in iterative mode, a single
+    /// DFS from one member may not reach all members. This method loops until
+    /// `next_fresh_member` returns `None`, ensuring every member is driven.
+    ///
+    /// If a merge occurred during the drive loop (detected via `merge_happened`),
+    /// the demotion is deferred: instead of resetting all states to Fresh
+    /// mid-loop (which would re-drive already-done members), we set the
+    /// `demoted` flag so `iterative_resolve_scc` restarts the iteration.
+    fn drive_all_iteration_members(&self) {
+        while let Some(id) = self.stack().next_fresh_member() {
+            self.drive_member(&id);
+            // If the member is still Fresh after driving, the drive was a
+            // no-op. This happens when solve_idx_erased encounters an
+            // Evicted module (another thread ran Solutions and freed
+            // Answers). The member's answer is already committed globally,
+            // so remove it from iteration state to prevent infinite looping.
+            if matches!(
+                self.stack().get_iteration_node_state(&id),
+                Some(IterationNodeStateKind::Fresh)
+            ) {
+                self.stack().remove_from_iteration_state(&id);
+            }
+        }
+        // If a merge happened during this drive loop, defer the demotion:
+        // set the demoted flag so iterative_resolve_scc will restart the
+        // iteration with all members Fresh. This ensures each member is
+        // visited at most once per drive loop, bounding work to O(N).
+        if self.stack().top_scc_merge_happened() {
+            self.stack().set_top_scc_demoted(true);
+        }
+    }
+
+    /// Iterative fixpoint driver for a completed SCC.
+    ///
+    /// Implements the two-loop algorithm:
+    /// - Outer loop (demotion): if SCC membership expands during iteration
+    ///   (detected by `demoted` flag), restart at iteration 1.
+    /// - Inner loop (fixpoint): iterate until answers converge (no change
+    ///   between iterations) or `MAX_ITERATIONS` is exceeded.
+    ///
+    /// Between iterations, the SCC is popped from the stack, its iteration
+    /// state is updated (previous answers extracted, fresh state set), and
+    /// it is pushed back for the next iteration (pop-mutate-push pattern).
+    ///
+    /// Absorption detection: if the top SCC's `detected_at` changes during
+    /// iteration (because this SCC was merged into an ancestor), the driver
+    /// returns without committing if an ancestor iteration driver exists to
+    /// pick up the merged SCC. If no ancestor is iterating, the current
+    /// driver continues with the updated identity to avoid orphaning.
+    #[allow(clippy::mutable_key_type)]
+    fn iterative_resolve_scc(&self, mut scc: Scc) {
+        let mut scc_identity = scc.detected_at.dupe();
+        let mut iteration: u32 = 1;
+        let mut demotions: u32 = 0;
+        let mut exceeded_max_iterations = false;
+
+        loop {
+            if iteration > MAX_ITERATIONS {
+                tracing::warn!(
+                    "iterative_resolve_scc: SCC {} exceeded {} iterations; \
+                     committing last answers",
+                    scc_identity,
+                    MAX_ITERATIONS,
+                );
+                exceeded_max_iterations = true;
+                break;
+            }
+
+            // Extract previous answers from the prior iteration (if any).
+            let previous_answers = if iteration > 1 {
+                scc.extract_done_answers()
+            } else {
+                BTreeMap::new()
+            };
+
+            // Set up fresh iteration state for this iteration.
+            scc.set_fresh_iteration_state(iteration, previous_answers);
+
+            // Push the SCC back onto the stack for this iteration.
+            self.stack().push_scc(scc);
+
+            // Drive all fresh members until none remain.
+            self.drive_all_iteration_members();
+
+            // Nested absorption guard: if a nested iteration driver absorbed
+            // and committed our SCC (via membership back-edge merge), the
+            // scc_stack is now empty. All members have been committed by the
+            // nested driver, so there is nothing left for us to do.
+            //
+            // TODO(stroxler): Is this actually necessary? It is harmless, but seems
+            // a bit defensive - I was expecting Pyrefly to always merge into the
+            // topmost Scc which would mean this isn't reachable. Investigate
+            // at some point once we've removed cycle-breaking code; as of
+            // this being added things are confusing and I don't want to remove
+            // a harmless defensive programming hook.
+            if self.stack().scc_stack_is_empty() {
+                return;
+            }
+
+            // Absorption detection: if the top SCC's detected_at no longer
+            // matches our identity, this SCC was absorbed during iteration.
+            // Three cases:
+            // 1. An ancestor iteration driver exists → it will handle the
+            //    merged SCC, so return.
+            // 2. No ancestor, but the top SCC contains our original
+            //    detected_at as a member → our SCC was merged into the top
+            //    SCC (merge changes detected_at to min). Continue driving
+            //    with the updated identity.
+            // 3. No ancestor, and the top SCC does NOT contain our member
+            //    → our SCC was committed by a nested driver, and a
+            //    pre-existing SCC (e.g. Phase 0) remains on top. Return
+            //    to avoid taking ownership of an unrelated SCC.
+            if self.stack().top_scc_detected_at() != scc_identity {
+                if self.stack().has_ancestor_iterating_scc() {
+                    return;
+                }
+                if !self.stack().top_scc_contains_member(&scc_identity) {
+                    // The top SCC doesn't contain our member. Our SCC was
+                    // committed by a nested driver; the remaining SCC is
+                    // unrelated.
+                    return;
+                }
+                // The top SCC absorbed our SCC via merge. Continue driving
+                // with the updated identity.
+                scc_identity = self.stack().top_scc_detected_at();
+            }
+
+            // Pop the SCC to inspect its iteration outcome.
+            scc = self.stack().pop_scc();
+
+            // Check for demotion: if SCC membership expanded, restart at
+            // iteration 1 with fresh state.
+            let iter_state = scc
+                .iterative
+                .as_ref()
+                .expect("iterative_resolve_scc: SCC lost iteration state after pop");
+            let demoted = iter_state.demoted;
+            let has_changed = iter_state.has_changed;
+
+            if demoted {
+                demotions += 1;
+                check_demotion_limit(demotions, &scc_identity);
+                iteration = 1;
+                continue;
+            }
+
+            // Convergence check: if this is iteration >= 2 and no answers
+            // changed, the fixpoint has converged.
+            if iteration >= 2 && !has_changed {
+                break;
+            }
+
+            iteration += 1;
+        }
+
+        // Report per-member errors for non-converging SCC members.
+        // Each member uses its own module's bindings and error collector
+        // because SCCs can span modules.
+        let non_convergent_members: Vec<(
+            CalcId,
+            Arc<dyn Any + Send + Sync>,
+            Option<Arc<dyn Any + Send + Sync>>,
+        )> = if exceeded_max_iterations {
+            let iter_state = scc.iterative.as_ref().expect(
+                "iterative_resolve_scc: SCC lost iteration state before non-convergence extraction",
+            );
+            iter_state
+                .node_states
+                .iter()
+                .filter_map(|(calc_id, node_state)| match node_state {
+                    IterationNodeState::Done { answer, .. } => Some((
+                        calc_id.dupe(),
+                        answer.dupe(),
+                        iter_state.previous_answers.get(calc_id).cloned(),
+                    )),
+                    IterationNodeState::Fresh | IterationNodeState::InProgress { .. } => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let did_commit = self.commit_final_answers(scc);
+        if did_commit {
+            for (calc_id, answer, previous) in &non_convergent_members {
+                let member_bindings = &calc_id.0;
+                if self.is_same_module(calc_id) {
+                    dispatch_anyidx!(
+                        &calc_id.1,
+                        self,
+                        check_and_report_non_convergent_member,
+                        answer,
+                        previous.as_ref(),
+                        member_bindings,
+                        self.base_errors
+                    );
+                } else {
+                    let cross_errors =
+                        ErrorCollector::new(calc_id.0.module().dupe(), ErrorStyle::Delayed);
+                    dispatch_anyidx!(
+                        &calc_id.1,
+                        self,
+                        check_and_report_non_convergent_member,
+                        answer,
+                        previous.as_ref(),
+                        member_bindings,
+                        &cross_errors
+                    );
+                    self.base_errors.extend(cross_errors);
+                }
             }
         }
     }
@@ -1439,7 +3173,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
-        let range = self.bindings().idx_to_key(idx).range();
+        let range = K::range_with(idx, self.bindings());
         let final_answer = K::record_recursive(self, range, answer, var, errors);
         if var != Var::ZERO {
             self.solver().force_var(var);
@@ -1516,7 +3250,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
     {
-        let range = self.bindings().idx_to_key(idx).range();
+        let range = K::range_with(idx, self.bindings());
         self.base_errors.add(
             range,
             ErrorInfo::Kind(ErrorKind::InternalError),
@@ -1560,7 +3294,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
 
         eprintln!("\n--- Triggering Idx Details ---");
         let key = self.bindings().idx_to_key(idx);
-        let range = key.range();
+        let range = K::range_with(idx, self.bindings());
         let display_range = self.bindings().module().display_range(range);
         eprintln!("  Module: {}", self.module().name());
         eprintln!("  Range: {}", display_range);
@@ -1669,22 +3403,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 self.get_idx(*prior_idx)
                     .arc_clone_ty()
                     .promote_implicit_literals(self.stdlib),
-            ),
-            Binding::TypeAlias {
-                name,
-                tparams,
-                key_type_alias,
-                range: _,
-            } => self.solver().fresh_alias_recursive(
-                self.uniques,
-                TypeAliasRef {
-                    name: name.clone(),
-                    args: None,
-                    module_name: self.module().name(),
-                    module_path: self.module().path().clone(),
-                    index: self.bindings().idx_to_key(*key_type_alias).0,
-                },
-                self.create_type_alias_params_recursive(tparams),
             ),
             _ => self.solver().fresh_recursive(self.uniques),
         }
@@ -1874,6 +3592,89 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             ],
         );
     }
+
+    /// Compare two type-erased answers for equality, dispatching through
+    /// the concrete answer type based on the `AnyIdx` variant.
+    ///
+    /// Used for convergence detection in the iterative fixpoint solver:
+    /// if answers haven't changed between iterations, the SCC has converged.
+    /// Assumes both answers have already been deep-forced (no unresolved Vars).
+    fn answers_equal(
+        &self,
+        idx: &AnyIdx,
+        old: &Arc<dyn Any + Send + Sync>,
+        new: &Arc<dyn Any + Send + Sync>,
+    ) -> bool {
+        dispatch_anyidx!(idx, self, answers_equal_typed, old, new)
+    }
+
+    /// Type-specialized answer comparison. Downcasts both type-erased answers
+    /// to `Arc<K::Answer>` and compares using `TypeEq`, which correctly handles
+    /// identity-based equality for `Unique`, `TypeVar`, etc.
+    fn answers_equal_typed<K: Solve<Ans>>(
+        &self,
+        _idx: Idx<K>,
+        old: &Arc<dyn Any + Send + Sync>,
+        new: &Arc<dyn Any + Send + Sync>,
+    ) -> bool {
+        let old_typed = old
+            .downcast_ref::<Arc<K::Answer>>()
+            .expect("answers_equal_typed: type mismatch on old answer");
+        let new_typed = new
+            .downcast_ref::<Arc<K::Answer>>()
+            .expect("answers_equal_typed: type mismatch on new answer");
+        let mut ctx = TypeEqCtx::default();
+        old_typed.type_eq(new_typed, &mut ctx)
+    }
+
+    /// Report a `NonConvergentRecursion` error on a single SCC member whose
+    /// answer changed in the final iteration. Called via `dispatch_anyidx!`
+    /// so that the concrete `K` (and therefore `K::Answer`) is known.
+    ///
+    /// `member_bindings` and `member_errors` must come from the member's own
+    /// module, not necessarily `self`. SCCs can span modules, so `self.bindings()`
+    /// and `self.base_errors` are only correct for same-module members.
+    ///
+    /// The message distinguishes `TypeInfo` answers ("inferred type") from
+    /// other answer kinds ("inferred result") for clarity in diagnostics.
+    fn check_and_report_non_convergent_member<K: Solve<Ans>>(
+        &self,
+        idx: Idx<K>,
+        current: &Arc<dyn Any + Send + Sync>,
+        previous: Option<&Arc<dyn Any + Send + Sync>>,
+        member_bindings: &Bindings,
+        member_errors: &ErrorCollector,
+    ) where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    {
+        // Only report if the answer actually changed from the previous iteration.
+        if let Some(prev) = previous
+            && self.answers_equal_typed::<K>(idx, prev, current)
+        {
+            return;
+        }
+        let typed_answer = current
+            .downcast_ref::<Arc<K::Answer>>()
+            .expect("check_and_report_non_convergent_member: type mismatch");
+        // TypeInfo answers represent inferred types; other answer kinds are
+        // internal results (class fields, metadata, etc.).
+        let noun = if current.downcast_ref::<Arc<TypeInfo>>().is_some() {
+            "type"
+        } else {
+            "result"
+        };
+        let range = K::range_with(idx, member_bindings);
+        member_errors.add(
+            range,
+            ErrorInfo::Kind(ErrorKind::NonConvergentRecursion),
+            vec1![format!(
+                "Fixpoint iteration did not converge. \
+                 Inferred {} `{}`. Adding annotations may help.",
+                noun, typed_answer,
+            )],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1910,12 +3711,24 @@ mod scc_tests {
             detected_at,
             anchor_pos,
             segment_size,
+            iterative: None,
         }
     }
 
     /// Helper to create a CalcStack for testing.
     fn make_calc_stack(entries: &[CalcId]) -> CalcStack {
-        let stack = CalcStack::new();
+        make_calc_stack_with_mode(entries, SccSolvingMode::default())
+    }
+
+    /// Helper to create a CalcStack for testing in iterative mode.
+    #[allow(dead_code)]
+    fn make_iterative_calc_stack(entries: &[CalcId]) -> CalcStack {
+        make_calc_stack_with_mode(entries, SccSolvingMode::Iterative)
+    }
+
+    /// Helper to create a CalcStack for testing with a specific solving mode.
+    fn make_calc_stack_with_mode(entries: &[CalcId], mode: SccSolvingMode) -> CalcStack {
+        let stack = CalcStack::new(mode);
         for entry in entries {
             stack.push_for_test(entry.dupe());
         }
@@ -1981,7 +3794,7 @@ mod scc_tests {
 
     #[test]
     fn test_current_cycle_empty_stack() {
-        let calc_stack = CalcStack::new();
+        let calc_stack = CalcStack::new(SccSolvingMode::default());
         assert!(calc_stack.current_cycle().is_none());
     }
 
@@ -2242,5 +4055,431 @@ mod scc_tests {
 
         // Should keep the minimum anchor_pos
         assert_eq!(merged.anchor_pos, 2);
+    }
+
+    #[test]
+    fn test_stale_calculation_panic() {
+        // Reproduces the panic where Calculation has stale state but CalcStack is fresh.
+        let calc_id = CalcId::for_test("m", 0);
+        let calculation: Calculation<usize> = Calculation::new();
+
+        // 1. Simulate stale state: propose calculation on this thread.
+        // This sets the thread bit in calculation.
+        match calculation.propose_calculation() {
+            ProposalResult::Calculatable => {}
+            _ => panic!("Expected Calculatable"),
+        }
+
+        // 2. Create a fresh stack (simulating a new request/thread reuse).
+        let stack = CalcStack::new(SccSolvingMode::default());
+
+        // 3. Push the same calculation.
+        // This should NOT panic.
+        let action = stack.push(calc_id, &calculation);
+
+        // 4. Expect Calculate action (to recover).
+        match action {
+            BindingAction::Calculate => {}
+            _ => panic!("Expected Calculate action to recover from stale state"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_membership_back_edge_merge_and_demotion() {
+        // Verify that pushing a CalcId which is a member of a non-top iterating
+        // SCC causes the SCCs to merge and the result to have merge_happened = true.
+        //
+        // Setup:
+        //   CalcStack = [A, B, C, D, E]
+        //   SCC0 (non-top): members {A, B}, iterating at iteration 2
+        //   SCC1 (top):     members {D, E}, iterating at iteration 1
+        //   C is between the two SCCs but not a member of either.
+        //
+        // Action: push(A, ...) -- A is a member of SCC0, the non-top SCC.
+        //
+        // Expected:
+        //   - SCCs merge into one (stack length goes from 2 to 1)
+        //   - Merged SCC has iterative.merge_happened == true
+        //   - Merged SCC contains members from both original SCCs {A, B, D, E}
+        //   - push returns Calculate (since new members are Fresh)
+        let a = CalcId::for_test("m", 0);
+        let b = CalcId::for_test("m", 1);
+        let c = CalcId::for_test("m", 2);
+        let d = CalcId::for_test("m", 3);
+        let e = CalcId::for_test("m", 4);
+
+        // Build the iterative CalcStack with [A, B, C, D, E].
+        let calc_stack =
+            make_iterative_calc_stack(&[a.dupe(), b.dupe(), c.dupe(), d.dupe(), e.dupe()]);
+
+        // Manually construct SCC0 with iterative state (iteration 2).
+        let scc0 = {
+            let mut node_state = BTreeMap::new();
+            node_state.insert(a.dupe(), NodeState::Fresh);
+            node_state.insert(b.dupe(), NodeState::Fresh);
+            let iter_nodes: BTreeMap<CalcId, IterationNodeState> = [
+                (a.dupe(), IterationNodeState::Fresh),
+                (b.dupe(), IterationNodeState::Fresh),
+            ]
+            .into_iter()
+            .collect();
+            Scc {
+                break_at: [a.dupe()].into_iter().collect(),
+                node_state,
+                detected_at: a.dupe(),
+                anchor_pos: 0,
+                segment_size: 2,
+                iterative: Some(SccIterationState {
+                    iteration: 2,
+                    node_states: iter_nodes,
+                    previous_answers: BTreeMap::new(),
+                    demoted: false,
+                    has_changed: false,
+                    merge_happened: false,
+                }),
+            }
+        };
+
+        // Manually construct SCC1 with iterative state (iteration 1).
+        let scc1 = {
+            let mut node_state = BTreeMap::new();
+            node_state.insert(d.dupe(), NodeState::Fresh);
+            node_state.insert(e.dupe(), NodeState::Fresh);
+            let iter_nodes: BTreeMap<CalcId, IterationNodeState> = [
+                (d.dupe(), IterationNodeState::Fresh),
+                (e.dupe(), IterationNodeState::Fresh),
+            ]
+            .into_iter()
+            .collect();
+            Scc {
+                break_at: [d.dupe()].into_iter().collect(),
+                node_state,
+                detected_at: d.dupe(),
+                anchor_pos: 3,
+                segment_size: 2,
+                iterative: Some(SccIterationState {
+                    iteration: 1,
+                    node_states: iter_nodes,
+                    previous_answers: BTreeMap::new(),
+                    demoted: false,
+                    has_changed: false,
+                    merge_happened: false,
+                }),
+            }
+        };
+
+        // Push both SCCs onto the scc_stack: SCC0 at bottom, SCC1 on top.
+        {
+            let mut scc_stack = calc_stack.scc_stack.borrow_mut();
+            scc_stack.push(scc0);
+            scc_stack.push(scc1);
+        }
+
+        // Verify initial state: two SCCs.
+        assert_eq!(calc_stack.borrow_scc_stack().len(), 2);
+
+        // Push A: A is a member of SCC0 (the non-top iterating SCC).
+        // This should trigger a membership back-edge merge.
+        let calculation: Calculation<usize> = Calculation::new();
+        let action = calc_stack.push(a.dupe(), &calculation);
+
+        // After merge, there should be exactly one SCC.
+        let scc_stack = calc_stack.borrow_scc_stack();
+        assert_eq!(
+            scc_stack.len(),
+            1,
+            "SCCs should have merged into one after membership back-edge"
+        );
+
+        let merged = &scc_stack[0];
+
+        // The merged SCC must have merge_happened = true (demotion is deferred
+        // until after drive_all_iteration_members completes).
+        let iter_state = merged
+            .iterative
+            .as_ref()
+            .expect("merged SCC should have iterative state");
+        assert!(
+            iter_state.merge_happened,
+            "merged SCC should have merge_happened = true after membership back-edge merge"
+        );
+        assert!(
+            !iter_state.demoted,
+            "merged SCC should have demoted = false (demotion is deferred)"
+        );
+
+        // Iteration should be preserved from self (the more advanced SCC).
+        assert_eq!(
+            iter_state.iteration, 2,
+            "merged SCC iteration should be preserved from self"
+        );
+
+        // All members from both original SCCs should be in the merged SCC's
+        // legacy node_state.
+        assert!(
+            merged.node_state.contains_key(&a),
+            "A should be in merged SCC"
+        );
+        assert!(
+            merged.node_state.contains_key(&b),
+            "B should be in merged SCC"
+        );
+        assert!(
+            merged.node_state.contains_key(&d),
+            "D should be in merged SCC"
+        );
+        assert!(
+            merged.node_state.contains_key(&e),
+            "E should be in merged SCC"
+        );
+
+        // All members should also be in the iteration node_states.
+        assert!(
+            iter_state.node_states.contains_key(&a),
+            "A should be in iteration node_states"
+        );
+        assert!(
+            iter_state.node_states.contains_key(&b),
+            "B should be in iteration node_states"
+        );
+        assert!(
+            iter_state.node_states.contains_key(&d),
+            "D should be in iteration node_states"
+        );
+        assert!(
+            iter_state.node_states.contains_key(&e),
+            "E should be in iteration node_states"
+        );
+
+        // The push should return Calculate because after demotion all nodes
+        // are Fresh, and A (the pushed target) transitions to Calculate.
+        assert!(
+            matches!(action, BindingAction::Calculate),
+            "push should return Calculate for a Fresh member after merge"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_absorption_detection() {
+        // Verify the absorption detection mechanism used by iterative_resolve_scc:
+        // when an iterating inner SCC is merged into an ancestor SCC during
+        // iteration, top_scc_detected_at() changes, allowing the driver to
+        // detect that absorption occurred and return without committing.
+        //
+        // Setup:
+        //   CalcStack = [A, B, C, D, E]
+        //   SCC_outer (ancestor): members {A, B}, detected_at = A, iterating at iteration 2
+        //   SCC_inner (top):      members {D, E}, detected_at = D, iterating at iteration 1
+        //   C is between the two SCCs but not a member of either.
+        //
+        // The iterative_resolve_scc driver for SCC_inner would have saved
+        // scc_identity = D (the inner SCC's detected_at) before pushing it
+        // onto the stack and driving members.
+        //
+        // Action: push(A, ...) -- simulates a dependency on A discovered during
+        //   driving of SCC_inner. A is a member of SCC_outer, triggering a
+        //   membership back-edge merge that absorbs SCC_inner into SCC_outer.
+        //
+        // Expected:
+        //   - After merge, only one SCC remains on the stack.
+        //   - top_scc_detected_at() returns A (the ancestor's detected_at),
+        //     NOT D (the inner SCC's original detected_at).
+        //   - This mismatch (top_scc_detected_at() != scc_identity) is the
+        //     absorption detection condition in iterative_resolve_scc.
+        let a = CalcId::for_test("m", 0);
+        let b = CalcId::for_test("m", 1);
+        let c = CalcId::for_test("m", 2);
+        let d = CalcId::for_test("m", 3);
+        let e = CalcId::for_test("m", 4);
+
+        // Build the iterative CalcStack with [A, B, C, D, E].
+        let calc_stack =
+            make_iterative_calc_stack(&[a.dupe(), b.dupe(), c.dupe(), d.dupe(), e.dupe()]);
+
+        // Manually construct SCC_outer (ancestor) with iterative state at iteration 2.
+        let scc_outer = {
+            let mut node_state = BTreeMap::new();
+            node_state.insert(a.dupe(), NodeState::Fresh);
+            node_state.insert(b.dupe(), NodeState::Fresh);
+            let iter_nodes: BTreeMap<CalcId, IterationNodeState> = [
+                (a.dupe(), IterationNodeState::Fresh),
+                (b.dupe(), IterationNodeState::Fresh),
+            ]
+            .into_iter()
+            .collect();
+            Scc {
+                break_at: [a.dupe()].into_iter().collect(),
+                node_state,
+                detected_at: a.dupe(),
+                anchor_pos: 0,
+                segment_size: 2,
+                iterative: Some(SccIterationState {
+                    iteration: 2,
+                    node_states: iter_nodes,
+                    previous_answers: BTreeMap::new(),
+                    demoted: false,
+                    has_changed: false,
+                    merge_happened: false,
+                }),
+            }
+        };
+
+        // Manually construct SCC_inner (top) with iterative state at iteration 1.
+        let scc_inner = {
+            let mut node_state = BTreeMap::new();
+            node_state.insert(d.dupe(), NodeState::Fresh);
+            node_state.insert(e.dupe(), NodeState::Fresh);
+            let iter_nodes: BTreeMap<CalcId, IterationNodeState> = [
+                (d.dupe(), IterationNodeState::Fresh),
+                (e.dupe(), IterationNodeState::Fresh),
+            ]
+            .into_iter()
+            .collect();
+            Scc {
+                break_at: [d.dupe()].into_iter().collect(),
+                node_state,
+                detected_at: d.dupe(),
+                anchor_pos: 3,
+                segment_size: 2,
+                iterative: Some(SccIterationState {
+                    iteration: 1,
+                    node_states: iter_nodes,
+                    previous_answers: BTreeMap::new(),
+                    demoted: false,
+                    has_changed: false,
+                    merge_happened: false,
+                }),
+            }
+        };
+
+        // Save the inner SCC's identity, as iterative_resolve_scc would.
+        let scc_identity = scc_inner.detected_at.dupe();
+
+        // Verify scc_identity is D (not A).
+        assert_eq!(
+            scc_identity, d,
+            "scc_identity should be D (the inner SCC's detected_at)"
+        );
+
+        // Push both SCCs: SCC_outer at bottom, SCC_inner on top.
+        {
+            let mut scc_stack = calc_stack.scc_stack.borrow_mut();
+            scc_stack.push(scc_outer);
+            scc_stack.push(scc_inner);
+        }
+
+        // Verify initial state: two SCCs, top detected_at == D.
+        assert_eq!(calc_stack.borrow_scc_stack().len(), 2);
+        assert_eq!(
+            calc_stack.top_scc_detected_at(),
+            d,
+            "before merge, top_scc_detected_at should be D"
+        );
+
+        // No absorption yet: the identity matches the top SCC's detected_at.
+        assert_eq!(
+            calc_stack.top_scc_detected_at(),
+            scc_identity,
+            "before merge, no absorption should be detected"
+        );
+
+        // Simulate what happens during driving: push(A) triggers a
+        // membership back-edge merge because A is in SCC_outer.
+        let calculation: Calculation<usize> = Calculation::new();
+        let _action = calc_stack.push(a.dupe(), &calculation);
+
+        // After merge, there should be exactly one SCC.
+        assert_eq!(
+            calc_stack.borrow_scc_stack().len(),
+            1,
+            "SCCs should have merged into one after membership back-edge"
+        );
+
+        // The absorption detection condition: top_scc_detected_at() != scc_identity.
+        // After merging, the top SCC's detected_at should be A (the ancestor's),
+        // which differs from D (the saved scc_identity).
+        let top_detected_at = calc_stack.top_scc_detected_at();
+        assert_eq!(
+            top_detected_at, a,
+            "after merge, top_scc_detected_at should be A (the ancestor's detected_at)"
+        );
+        assert_ne!(
+            top_detected_at, scc_identity,
+            "absorption detection: top_scc_detected_at should differ from the \
+             inner SCC's saved identity, signaling that the inner SCC was absorbed"
+        );
+
+        // Verify the merged SCC has merge_happened = true (confirming the
+        // merge actually happened; demotion is deferred to drive_all_iteration_members).
+        let scc_stack = calc_stack.borrow_scc_stack();
+        let merged = &scc_stack[0];
+        let iter_state = merged
+            .iterative
+            .as_ref()
+            .expect("merged SCC should have iterative state");
+        assert!(
+            iter_state.merge_happened,
+            "merged SCC should have merge_happened = true"
+        );
+        assert!(
+            !iter_state.demoted,
+            "merged SCC should have demoted = false (demotion is deferred)"
+        );
+    }
+
+    #[test]
+    fn test_demotion_limit_constants() {
+        // Verify the safety-limit constants have the expected values.
+        // These constants guard against infinite membership expansion in the
+        // iterative SCC solver. Changing them without updating tests should
+        // be a deliberate decision.
+        assert_eq!(
+            MAX_DEMOTIONS, 10,
+            "MAX_DEMOTIONS should be 10; changing this limit affects \
+             how many SCC membership expansions are tolerated before panic"
+        );
+        assert_eq!(
+            MAX_ITERATIONS, 5,
+            "MAX_ITERATIONS should be 5; changing this limit affects \
+             how many fixpoint iterations are attempted before giving up"
+        );
+    }
+
+    #[test]
+    fn test_check_demotion_limit_allows_demotions_at_limit() {
+        // Demotions at exactly MAX_DEMOTIONS should NOT panic.
+        // The check is `demotions > MAX_DEMOTIONS`, so 10 is the last
+        // allowed value.
+        let id = CalcId::for_test("m", 0);
+        check_demotion_limit(MAX_DEMOTIONS, &id); // should not panic
+    }
+
+    #[test]
+    fn test_check_demotion_limit_allows_demotions_below_limit() {
+        // Any demotion count below the limit should be fine.
+        let id = CalcId::for_test("m", 0);
+        for count in 0..MAX_DEMOTIONS {
+            check_demotion_limit(count, &id); // should not panic
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeded 10 demotions")]
+    fn test_check_demotion_limit_panics_above_limit() {
+        // One demotion past the limit should trigger the panic with the
+        // expected message substring.
+        let id = CalcId::for_test("m", 0);
+        check_demotion_limit(MAX_DEMOTIONS + 1, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "likely infinite membership expansion")]
+    fn test_check_demotion_limit_panic_message() {
+        // Verify the panic message contains the diagnostic hint so that
+        // developers investigating a crash can identify the root cause.
+        let id = CalcId::for_test("m", 0);
+        check_demotion_limit(MAX_DEMOTIONS + 1, &id);
     }
 }

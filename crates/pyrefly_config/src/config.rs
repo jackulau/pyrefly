@@ -58,6 +58,7 @@ use tracing::error;
 
 use crate::base::ConfigBase;
 use crate::base::RecursionLimitConfig;
+use crate::base::SccMode;
 use crate::base::UntypedDefBehavior;
 use crate::environment::environment::PythonEnvironment;
 use crate::environment::interpreters::Interpreters;
@@ -818,6 +819,14 @@ impl ConfigFile {
                  self.root.tensor_shapes.unwrap())
     }
 
+    pub fn strict_callable_subtyping(&self, path: &Path) -> bool {
+        self.get_from_sub_configs(ConfigBase::get_strict_callable_subtyping, path)
+            .unwrap_or_else(||
+                 // we can use unwrap here, because the value in the root config must
+                 // be set in `ConfigFile::configure()`.
+                 self.root.strict_callable_subtyping.unwrap())
+    }
+
     pub fn enabled_ignores(&self, path: &Path) -> &SmallSet<Tool> {
         self.get_from_sub_configs(ConfigBase::get_enabled_ignores, path)
             .unwrap_or_else(||
@@ -830,6 +839,12 @@ impl ConfigFile {
     /// Returns None if not set (disabled).
     pub fn recursion_limit_config(&self) -> Option<RecursionLimitConfig> {
         ConfigBase::get_recursion_limit_config(&self.root)
+    }
+
+    /// Get the SCC solving mode.
+    /// Returns the default (`CyclesDualWrite`) if not set.
+    pub fn scc_mode(&self) -> SccMode {
+        ConfigBase::get_scc_mode(&self.root)
     }
 
     pub fn get_error_config(&self, path: &Path) -> ErrorConfig<'_> {
@@ -872,16 +887,23 @@ impl ConfigFile {
         {
             Some(handle) => handle.dupe(),
             None => {
+                // Check site-package paths before search paths so that files
+                // in site-packages (which live under the project root) get their
+                // module name from the more specific site-packages prefix rather
+                // than from the project root.
                 let module_kind = if fallback_search_path.is_empty() {
-                    let name = ModuleName::from_path(module_path.as_path(), self.search_path())
-                        .unwrap_or_else(ModuleName::unknown);
+                    let name = ModuleName::from_path(
+                        module_path.as_path(),
+                        self.search_path().chain(self.site_package_path()),
+                    )
+                    .unwrap_or_else(ModuleName::unknown);
                     ModuleNameWithKind::guaranteed(name)
                 } else {
                     let fallback_paths =
                         fallback_search_path.for_directory(Some(module_path.as_path()));
                     ModuleName::from_path_with_fallback(
                         module_path.as_path(),
-                        self.search_path(),
+                        self.search_path().chain(self.site_package_path()),
                         fallback_paths.iter(),
                     )
                     .unwrap_or(ModuleNameWithKind::guaranteed(ModuleName::unknown()))
@@ -1081,6 +1103,10 @@ impl ConfigFile {
             self.root.tensor_shapes = Some(false);
         }
 
+        if self.root.strict_callable_subtyping.is_none() {
+            self.root.strict_callable_subtyping = Some(false);
+        }
+
         let tools_from_permissive_ignores = match self.root.permissive_ignores {
             Some(true) => Some(Tool::all()),
             Some(false) => Some(Tool::default_enabled()),
@@ -1125,36 +1151,6 @@ impl ConfigFile {
                 Err(error) => Some(error),
             }
         };
-
-        // TODO(connernilsen): remove once PyTorch performs an upgrade
-        #[allow(unexpected_cfgs)]
-        if cfg!(fbcode_build) {
-            let root = match &self.source {
-                ConfigSource::File(path) => {
-                    let mut root = path.to_path_buf();
-                    root.pop();
-                    Some(root)
-                }
-                _ => None,
-            };
-            if let Some(root) = root
-                && root.ends_with("fbsource/fbcode/caffe2")
-            {
-                self.build_system = Some(BuildSystem::new(
-                    Some(".pyrelsp".to_owned()),
-                    Some(vec![
-                        "--oncall=pyre".to_owned(),
-                        "--client-metadata=id=pyrefly".to_owned(),
-                    ]),
-                    true,
-                    vec![
-                        "../python/typeshed_experimental".into(),
-                        "../python/typeshed_internal".into(),
-                        "../python/pyre_temporary_stubs".into(),
-                    ],
-                ));
-            }
-        }
 
         if let Some(build_system) = &mut self.build_system
             && let Some(error) = configure_source_db(build_system)
@@ -1402,6 +1398,7 @@ mod tests {
              ignore-missing-imports = []
              ignore-errors-in-generated-code = false
              infer-with-first-use = false
+             strict-callable-subtyping = false
              [sub-config.errors]
              assert-type = false
              invalid-yield = false
@@ -1454,6 +1451,7 @@ mod tests {
                     disable_type_errors_in_ide: None,
                     ignore_errors_in_generated_code: Some(true),
                     infer_with_first_use: None,
+                    strict_callable_subtyping: None,
                     tensor_shapes: None,
                     replace_imports_with_any: Some(vec![ModuleWildcard::new("fibonacci").unwrap()]),
                     ignore_missing_imports: Some(vec![ModuleWildcard::new("sprout").unwrap()]),
@@ -1462,6 +1460,7 @@ mod tests {
                     enabled_ignores: None,
                     recursion_depth_limit: None,
                     recursion_overflow_handler: None,
+                    scc_mode: None,
                 },
                 source_db: Default::default(),
                 sub_configs: vec![SubConfig {
@@ -1475,6 +1474,7 @@ mod tests {
                         disable_type_errors_in_ide: None,
                         ignore_errors_in_generated_code: Some(false),
                         infer_with_first_use: Some(false),
+                        strict_callable_subtyping: Some(false),
                         tensor_shapes: None,
                         replace_imports_with_any: Some(Vec::new()),
                         ignore_missing_imports: Some(Vec::new()),
@@ -1483,6 +1483,7 @@ mod tests {
                         enabled_ignores: None,
                         recursion_depth_limit: None,
                         recursion_overflow_handler: None,
+                        scc_mode: None,
                     }
                 }],
                 typeshed_path: None,
@@ -1862,12 +1863,14 @@ baseline = "baseline.json"
                 disable_type_errors_in_ide: Some(true),
                 ignore_errors_in_generated_code: Some(false),
                 infer_with_first_use: Some(true),
+                strict_callable_subtyping: Some(false),
                 tensor_shapes: None,
                 extras: Default::default(),
                 permissive_ignores: Some(false),
                 enabled_ignores: None,
                 recursion_depth_limit: None,
                 recursion_overflow_handler: None,
+                scc_mode: None,
             },
             sub_configs: vec![
                 SubConfig {
@@ -2172,12 +2175,14 @@ baseline = "baseline.json"
                 disable_type_errors_in_ide: Some(true),
                 ignore_errors_in_generated_code: Some(false),
                 infer_with_first_use: Some(true),
+                strict_callable_subtyping: Some(false),
                 tensor_shapes: None,
                 extras: Default::default(),
                 permissive_ignores: Some(false),
                 enabled_ignores: None,
                 recursion_depth_limit: None,
                 recursion_overflow_handler: None,
+                scc_mode: None,
             },
             sub_configs: vec![],
             ..Default::default()
@@ -2207,12 +2212,14 @@ baseline = "baseline.json"
                 disable_type_errors_in_ide: Some(true),
                 ignore_errors_in_generated_code: Some(false),
                 infer_with_first_use: Some(true),
+                strict_callable_subtyping: Some(false),
                 tensor_shapes: None,
                 extras: Default::default(),
                 permissive_ignores: Some(false),
                 enabled_ignores: None,
                 recursion_depth_limit: None,
                 recursion_overflow_handler: None,
+                scc_mode: None,
             },
             sub_configs: vec![],
             ..Default::default()

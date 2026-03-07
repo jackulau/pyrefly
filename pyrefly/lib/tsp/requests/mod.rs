@@ -7,5 +7,7 @@
 
 //! TSP request implementations
 
+pub mod get_python_search_paths;
 pub mod get_snapshot;
 pub mod get_supported_protocol_version;
+pub mod resolve_import;

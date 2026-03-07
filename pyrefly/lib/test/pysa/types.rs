@@ -384,7 +384,7 @@ class MyTypedDict(TypedDict):
         PysaType::from_type(
             &context.answers.heap().mk_quantified(Quantified::type_var(
                 Name::new_static("T"),
-                &UniqueFactory::new(),
+                UniqueFactory::new().fresh(),
                 /* default */ None,
                 Restriction::Bound(context.answers.heap().mk_class_type(ClassType::new(
                     get_class("test", "MyClass", &context),
@@ -412,7 +412,7 @@ class MyTypedDict(TypedDict):
         PysaType::from_type(
             &context.answers.heap().mk_quantified(Quantified::type_var(
                 Name::new_static("T"),
-                &UniqueFactory::new(),
+                UniqueFactory::new().fresh(),
                 /* default */ None,
                 Restriction::Constraints(vec![
                     context.answers.heap().mk_class_type(ClassType::new(

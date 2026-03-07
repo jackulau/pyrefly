@@ -35,7 +35,6 @@ use crate::alt::attr::AttrDefinition;
 use crate::alt::attr::AttrInfo;
 use crate::alt::traits::Solve;
 use crate::binding::binding::AnyIdx;
-use crate::binding::binding::ChangedExport;
 use crate::binding::binding::Exported;
 use crate::binding::binding::Key;
 use crate::binding::binding::Keyed;
@@ -44,6 +43,7 @@ use crate::binding::bindings::BindingTable;
 use crate::binding::bindings::Bindings;
 use crate::binding::table::TableKeyed;
 use crate::config::base::RecursionLimitConfig;
+use crate::config::base::SccMode;
 use crate::dispatch_anyidx;
 use crate::error::collector::ErrorCollector;
 use crate::error::style::ErrorStyle;
@@ -53,6 +53,7 @@ use crate::solver::solver::Solver;
 use crate::solver::solver::VarRecurser;
 use crate::state::ide::IntermediateDefinition;
 use crate::state::ide::key_to_intermediate_definition;
+use crate::state::state::ModuleChanges;
 use crate::table;
 use crate::table_for_each;
 use crate::table_mut_for_each;
@@ -62,6 +63,9 @@ use crate::types::equality::TypeEq;
 use crate::types::equality::TypeEqCtx;
 use crate::types::heap::TypeHeap;
 use crate::types::stdlib::Stdlib;
+use crate::types::types::Forall;
+use crate::types::types::Forallable;
+use crate::types::types::TParams;
 use crate::types::types::Type;
 
 /// The index stores all the references where the definition is external to the current module.
@@ -82,14 +86,36 @@ pub struct Index {
     pub parent_methods_map: SmallMap<TextRange, Vec<(ModulePath, TextRange)>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OverloadTrace {
+    callable: Callable,
+    tparams: Option<Arc<TParams>>,
+}
+
+impl OverloadTrace {
+    pub(crate) fn new(callable: Callable, tparams: Option<Arc<TParams>>) -> Self {
+        Self { callable, tparams }
+    }
+
+    fn as_type(&self) -> Type {
+        match &self.tparams {
+            Some(tparams) if !tparams.is_empty() => Type::Forall(Box::new(Forall {
+                tparams: tparams.clone(),
+                body: Forallable::Callable(self.callable.clone()),
+            })),
+            _ => Type::Callable(Box::new(self.callable.clone())),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OverloadedCallee {
     Resolved {
-        callable: Callable,
+        callable: OverloadTrace,
     },
     Candidates {
-        all: Vec<Callable>,
-        closest: Callable,
+        all: Vec<OverloadTrace>,
+        closest: OverloadTrace,
         is_closest_chosen: bool,
     },
 }
@@ -353,20 +379,17 @@ impl Solutions {
         difference
     }
 
-    /// Compute the set of exports that have changed between two solutions.
-    /// Returns a set of `ChangedExport` values: either `Name` (for `KeyExport`) or
-    /// `ClassDefIndex` (for class-related keys).
-    pub fn changed_exports(
-        &self,
-        other: &Self,
-    ) -> starlark_map::small_set::SmallSet<ChangedExport> {
-        use starlark_map::small_set::SmallSet;
-
+    /// Diff two solutions and merge changed keys into `changed`.
+    ///
+    /// For each exported key, records the change with the correct semantics:
+    /// - Added/removed keys: existence change (default NameDep for name keys).
+    /// - Value changed: type/metadata change (name still exists).
+    pub fn changed_exports(&self, other: &Self, changed: &mut ModuleChanges) {
         fn check_table<K: Keyed>(
             x: &SolutionsEntry<K>,
             y: &Solutions,
             ctx: &mut TypeEqCtx,
-            changed: &mut SmallSet<ChangedExport>,
+            changed: &mut ModuleChanges,
         ) where
             SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
         {
@@ -376,12 +399,12 @@ impl Solutions {
 
             let y_table = y.table.get::<K>();
 
-            // Check for items only in y (added keys)
+            // Check for items only in y (added keys) — existence change.
             for (k, _v) in y_table {
                 if !x.contains_key(k)
                     && let Some(anykey) = k.try_to_anykey()
                 {
-                    changed.insert(anykey.to_changed_export());
+                    changed.add_key_existence(anykey);
                 }
             }
 
@@ -389,15 +412,15 @@ impl Solutions {
             for (k, v) in x {
                 match y_table.get(k) {
                     Some(v2) if !v.type_eq(v2, ctx) => {
-                        // Value changed
+                        // Value changed — type/metadata change, key still exists.
                         if let Some(anykey) = k.try_to_anykey() {
-                            changed.insert(anykey.to_changed_export());
+                            changed.add_key(anykey);
                         }
                     }
                     None => {
-                        // Key removed
+                        // Key removed — existence change.
                         if let Some(anykey) = k.try_to_anykey() {
-                            changed.insert(anykey.to_changed_export());
+                            changed.add_key_existence(anykey);
                         }
                     }
                     _ => {}
@@ -405,17 +428,75 @@ impl Solutions {
             }
         }
 
-        let mut changed = SmallSet::new();
         // Important we have a single TypeEqCtx, so that we don't have
         // types used in different ways.
         let mut ctx = TypeEqCtx::default();
 
         // Check all tables
         table_for_each!(self.table, |x| {
-            check_table(x, other, &mut ctx, &mut changed);
+            check_table(x, other, &mut ctx, changed);
         });
+    }
 
-        changed
+    /// Record exports that changed between new solutions (self) and old answers
+    /// (bindings + answers) into `changed`. This is used when the old solutions
+    /// were None but old answers exist — e.g., the module was previously only
+    /// computed up to Answers and is now computed to Solutions for the first time.
+    ///
+    /// If a calculation in old answers was never forced, we skip it — nothing
+    /// could have depended on it, so there's no change to propagate.
+    pub fn changed_exports_vs_answers(
+        &self,
+        old_bindings: &Bindings,
+        old_answers: &Answers,
+        changed: &mut ModuleChanges,
+    ) {
+        fn check_table_vs_answers<K: Keyed>(
+            new_solutions: &SolutionsEntry<K>,
+            old_bindings: &Bindings,
+            old_answers: &Answers,
+            ctx: &mut TypeEqCtx,
+            changed: &mut ModuleChanges,
+        ) where
+            SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
+            BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+            AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        {
+            if !K::EXPORTED {
+                return;
+            }
+
+            for (k, new_val) in new_solutions {
+                let Some(anykey) = k.try_to_anykey() else {
+                    continue;
+                };
+                let hashed_k = Hashed::new(k);
+                match old_bindings.key_to_idx_hashed_opt::<K>(hashed_k) {
+                    Some(idx) => {
+                        // Key existed in old answers — compare values.
+                        match old_answers.get_idx::<K>(idx) {
+                            Some(old_val) if !old_val.type_eq(new_val, ctx) => {
+                                changed.add_key(anykey);
+                            }
+                            // None means the old answer was never computed, so
+                            // no downstream module ever depended on this value.
+                            // No change to propagate.
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        // Key didn't exist in old bindings — new export, treat as changed.
+                        changed.add_key_existence(anykey);
+                    }
+                }
+            }
+        }
+
+        let mut ctx = TypeEqCtx::default();
+
+        table_for_each!(self.table, |x| {
+            check_table_vs_answers(x, old_bindings, old_answers, &mut ctx, changed);
+        });
     }
 
     pub fn get_index(&self) -> Option<Arc<Mutex<Index>>> {
@@ -455,6 +536,49 @@ pub trait LookupAnswer: Sized {
     ) -> bool {
         false
     }
+
+    /// Drive a cross-module iteration member by calling `get_idx` in the
+    /// target module's context.
+    ///
+    /// Used during iterative SCC solving when a member belongs to a different
+    /// module than the current solver. The answer from `get_idx` is stored in
+    /// iteration state on the shared `CalcStack` (via the shared `ThreadState`),
+    /// so no return value is needed.
+    ///
+    /// Returns true if the driving was performed, false if the implementation
+    /// does not support cross-module driving.
+    ///
+    /// Default implementation returns false (not supported).
+    fn solve_idx_erased(&self, _calc_id: &CalcId, _thread_state: &ThreadState) -> bool {
+        false
+    }
+
+    /// Acquire a write lock on a cross-module Calculation cell for SCC
+    /// batch commit. Returns true if the lock was acquired.
+    ///
+    /// Default implementation returns false (not supported).
+    fn write_lock_in_module(&self, _calc_id: &CalcId) -> bool {
+        false
+    }
+
+    /// Write a value to a write-locked cross-module Calculation cell and
+    /// release the lock. Also extends errors if the write wins.
+    ///
+    /// Default implementation is a no-op.
+    fn write_unlock_in_module(
+        &self,
+        _calc_id: CalcId,
+        _answer: Arc<dyn Any + Send + Sync>,
+        _errors: Option<Arc<ErrorCollector>>,
+    ) -> bool {
+        false
+    }
+
+    /// Release a write lock on a cross-module Calculation cell without
+    /// writing a value. Used for panic cleanup.
+    ///
+    /// Default implementation is a no-op.
+    fn write_unlock_empty_in_module(&self, _calc_id: &CalcId) {}
 }
 
 impl Answers {
@@ -520,6 +644,7 @@ impl Answers {
         uniques: &UniqueFactory,
         compute_everything: bool,
         recursion_limit_config: Option<RecursionLimitConfig>,
+        scc_mode: SccMode,
     ) -> Solutions {
         let mut res = SolutionsTable::default();
 
@@ -550,7 +675,7 @@ impl Answers {
             }
         }
         let recurser = &VarRecurser::new();
-        let thread_state = &ThreadState::new(recursion_limit_config);
+        let thread_state = &ThreadState::new(recursion_limit_config, scc_mode);
         let answers_solver = AnswersSolver::new(
             answers,
             self,
@@ -671,6 +796,39 @@ impl Answers {
         dispatch_anyidx!(any_idx, self, commit_typed, answer)
     }
 
+    /// Drive a cross-module iteration member by constructing a temporary
+    /// `AnswersSolver` for this module and calling `get_idx` on the member.
+    ///
+    /// Target-side entry point for cross-module iterative driving. The answer
+    /// is stored in SCC iteration state on the shared `CalcStack` (via
+    /// `thread_state`), so the `get_idx` result is discarded.
+    pub fn solve_idx_erased<Ans: LookupAnswer>(
+        &self,
+        any_idx: &AnyIdx,
+        answers: &Ans,
+        bindings: &Bindings,
+        exports: &dyn LookupExport,
+        errors: &ErrorCollector,
+        stdlib: &Stdlib,
+        uniques: &UniqueFactory,
+        thread_state: &ThreadState,
+    ) {
+        let recurser = &VarRecurser::new();
+        let solver = AnswersSolver::new(
+            answers,
+            self,
+            errors,
+            bindings,
+            exports,
+            uniques,
+            recurser,
+            stdlib,
+            thread_state,
+            self.heap(),
+        );
+        dispatch_anyidx!(any_idx, solver, solve_idx_erased_typed);
+    }
+
     /// Typed commit for a specific key type. Downcasts the answer and writes
     /// to the Calculation cell. Returns true if this write won the first-write-wins
     /// race (i.e., the answer was actually stored).
@@ -691,6 +849,65 @@ impl Answers {
             did_write
         } else {
             false
+        }
+    }
+
+    /// Acquire a write lock on a cell for SCC batch commit.
+    /// Returns true if the lock was acquired, false if the cell is already
+    /// `Calculated` (no lock needed since writes would be no-ops).
+    pub fn write_lock_preliminary(&self, any_idx: &AnyIdx) -> bool {
+        dispatch_anyidx!(any_idx, self, write_lock_typed)
+    }
+
+    /// Write a value to a write-locked cell and release the lock.
+    /// Returns true if this write stored the value (first-write-wins).
+    pub fn write_unlock_preliminary(
+        &self,
+        any_idx: &AnyIdx,
+        answer: Arc<dyn Any + Send + Sync>,
+    ) -> bool {
+        dispatch_anyidx!(any_idx, self, write_unlock_typed, answer)
+    }
+
+    /// Release a write lock without writing a value (panic cleanup).
+    pub fn write_unlock_empty_preliminary(&self, any_idx: &AnyIdx) {
+        dispatch_anyidx!(any_idx, self, write_unlock_empty_typed)
+    }
+
+    fn write_lock_typed<K: Keyed>(&self, idx: Idx<K>) -> bool
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    {
+        if let Some(calculation) = self.table.get::<K>().get(idx) {
+            calculation.write_lock()
+        } else {
+            false
+        }
+    }
+
+    fn write_unlock_typed<K: Keyed>(&self, idx: Idx<K>, answer: Arc<dyn Any + Send + Sync>) -> bool
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    {
+        let typed_answer: Arc<K::Answer> = Arc::unwrap_or_clone(
+            answer
+                .downcast::<Arc<K::Answer>>()
+                .expect("Answers::write_unlock_typed: type mismatch"),
+        );
+        if let Some(calculation) = self.table.get::<K>().get(idx) {
+            let (_answer, did_write) = calculation.write_unlock(typed_answer);
+            did_write
+        } else {
+            false
+        }
+    }
+
+    fn write_unlock_empty_typed<K: Keyed>(&self, idx: Idx<K>)
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    {
+        if let Some(calculation) = self.table.get::<K>().get(idx) {
+            calculation.write_unlock_empty();
         }
     }
 
@@ -719,16 +936,12 @@ impl Answers {
     pub fn get_chosen_overload_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
         match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => {
-                Some(self.deep_force(self.heap().mk_callable_from(callable.clone())))
-            }
+            OverloadedCallee::Resolved { callable } => Some(self.deep_force(callable.as_type())),
             OverloadedCallee::Candidates {
                 closest,
                 is_closest_chosen,
                 ..
-            } if *is_closest_chosen => {
-                Some(self.deep_force(self.heap().mk_callable_from(closest.clone())))
-            }
+            } if *is_closest_chosen => Some(self.deep_force(closest.as_type())),
             _ => None,
         }
     }
@@ -740,10 +953,15 @@ impl Answers {
     ) -> Option<(Vec<Callable>, Option<usize>)> {
         let lock = self.trace.as_ref()?.lock();
         match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => Some((vec![callable.clone()], Some(0))),
+            OverloadedCallee::Resolved { callable } => {
+                Some((vec![callable.callable.clone()], Some(0)))
+            }
             OverloadedCallee::Candidates { all, closest, .. } => {
-                let chosen_index = all.iter().position(|signature| signature == closest);
-                Some((all.clone(), chosen_index))
+                let chosen_index = all
+                    .iter()
+                    .position(|signature| signature.callable == closest.callable);
+                let signatures = all.iter().map(|trace| trace.callable.clone()).collect();
+                Some((signatures, chosen_index))
             }
         }
     }
@@ -791,28 +1009,30 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if let Some(trace) = &self.current().trace
             && let Some(callable) = ty.to_callable()
         {
-            trace
-                .lock()
-                .overloaded_callees
-                .insert(loc, OverloadedCallee::Resolved { callable });
+            trace.lock().overloaded_callees.insert(
+                loc,
+                OverloadedCallee::Resolved {
+                    callable: OverloadTrace::new(callable, None),
+                },
+            );
         }
     }
 
     /// Record all the overloads and the chosen overload.
     /// The trace will be used to power signature help and hover for overloaded functions.
-    pub fn record_overload_trace(
+    pub(crate) fn record_overload_trace(
         &self,
         loc: TextRange,
-        all_overloads: Vec<&Callable>,
-        closest_overload: &Callable,
+        all_overloads: Vec<OverloadTrace>,
+        closest_overload: OverloadTrace,
         is_closest_overload_chosen: bool,
     ) {
         if let Some(trace) = &self.current().trace {
             trace.lock().overloaded_callees.insert(
                 loc,
                 OverloadedCallee::Candidates {
-                    all: all_overloads.into_iter().cloned().collect(),
-                    closest: closest_overload.clone(),
+                    all: all_overloads,
+                    closest: closest_overload,
                     is_closest_chosen: is_closest_overload_chosen,
                 },
             );

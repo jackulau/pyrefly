@@ -15,6 +15,23 @@ use toml::Table;
 use crate::error::ErrorDisplayConfig;
 use crate::module_wildcard::ModuleWildcard;
 
+/// Which SCC-solving strategy to use during type checking.
+///
+/// This controls how strongly connected components (cycles) in the binding
+/// graph are resolved. The default is `CyclesDualWrite`, which writes answers
+/// eagerly for cross-thread visibility. `CyclesThreadLocal` defers writes
+/// until the entire SCC completes. `IterativeFixpoint` re-solves SCC members
+/// in a fixpoint loop until answers converge.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy, Default)]
+#[derive(ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SccMode {
+    #[default]
+    CyclesDualWrite,
+    CyclesThreadLocal,
+    IterativeFixpoint,
+}
+
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy, Default)]
 #[derive(ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -108,12 +125,15 @@ pub struct ConfigBase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub infer_with_first_use: Option<bool>,
 
-    /// Whether to enable tensor shape type inference.
-    /// When enabled, integer literals can be used as type arguments (e.g., Tensor[2, 3]),
-    /// and type variables can participate in dimension arithmetic.
-    /// By default this is disabled.
+    /// (Experimental) Enable tensor shape type inference.
+    /// Supports both native (Tensor[N, M]) and jaxtyping (Float[Tensor, "batch channels"]) syntax.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensor_shapes: Option<bool>,
+
+    /// Which SCC-solving strategy to use during type checking.
+    /// Defaults to `CyclesDualWrite` when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scc_mode: Option<SccMode>,
 
     /// Maximum recursion depth before triggering overflow protection.
     /// Set to 0 to disable (default). This helps detect potential stack overflow situations.
@@ -124,6 +144,13 @@ pub struct ConfigBase {
     /// Only used when `recursion-depth-limit` is set to a non-zero value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recursion_overflow_handler: Option<RecursionOverflowHandler>,
+
+    /// Whether to strictly check callable subtyping for signatures with `*args: Any, **kwargs: Any`.
+    /// When false (the default), callables with `*args: Any, **kwargs: Any` are treated as
+    /// compatible with any signature (similar to `...` behavior).
+    /// When true, parameter list compatibility is checked strictly even when `*args: Any, **kwargs: Any` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_callable_subtyping: Option<bool>,
 
     /// Any unknown config items
     #[serde(default, flatten)]
@@ -187,6 +214,12 @@ impl ConfigBase {
         base.enabled_ignores.as_ref()
     }
 
+    /// Get the SCC solving mode configuration.
+    /// Returns the default (`CyclesDualWrite`) if not set.
+    pub fn get_scc_mode(base: &Self) -> SccMode {
+        base.scc_mode.unwrap_or_default()
+    }
+
     /// Get the recursion limit configuration, if enabled.
     /// Returns None if recursion_depth_limit is not set or is 0.
     pub fn get_recursion_limit_config(base: &Self) -> Option<RecursionLimitConfig> {
@@ -202,5 +235,9 @@ impl ConfigBase {
                 })
             }
         })
+    }
+
+    pub fn get_strict_callable_subtyping(base: &Self) -> Option<bool> {
+        base.strict_callable_subtyping
     }
 }

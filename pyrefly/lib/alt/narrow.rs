@@ -5,10 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
+
 use num_traits::ToPrimitive;
 use pyrefly_config::error_kind::ErrorKind;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
+use pyrefly_python::dunder;
 use pyrefly_types::class::Class;
 use pyrefly_types::display::TypeDisplayContext;
 use pyrefly_types::facet::FacetChain;
@@ -108,8 +111,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         }
     }
 
-    fn is_final(&self, cls: &ClassType) -> bool {
-        let class = cls.class_object();
+    fn is_final(&self, class: &Class) -> bool {
         self.get_metadata_for_class(class).is_final()
             || (self.get_enum_from_class(class).is_some()
                 && !self.get_enum_members(class).is_empty())
@@ -145,7 +147,8 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 fallback
             } else if let Type::ClassType(left_cls) = left
                 && let Type::ClassType(right_cls) = right
-                && (self.is_final(left_cls) || self.is_final(right_cls))
+                && (self.is_final(left_cls.class_object())
+                    || self.is_final(right_cls.class_object()))
             {
                 // The only way for `left & right` to exist is if it is an instance of a class that
                 // multiply inherits from both `left` and `right`'s classes. But at least one of
@@ -275,11 +278,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         left: &Type,
         right_expr: &Expr,
+        source: NarrowSource,
         errors: &ErrorCollector,
     ) -> Type {
+        let force_allow_negative = matches!(source, NarrowSource::Pattern);
         let mut res = Vec::new();
         for (right, allows_negative_narrow) in self.expr_as_class_info(right_expr, errors) {
             res.push(self.distribute_over_union(left, |l| {
+                let allows_negative_narrow = allows_negative_narrow || force_allow_negative;
                 if allows_negative_narrow
                     && let Some((tparams, right)) = self.unwrap_class_object_silently(&right)
                 {
@@ -298,6 +304,31 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             }));
         }
         self.intersects(&res)
+    }
+
+    /// Narrow `type(X) != Y`. We can only do negative narrowing if Y is final,
+    /// because otherwise X could still be a subclass of Y.
+    fn narrow_type_not_eq(&self, left: &Type, right_expr: &Expr, errors: &ErrorCollector) -> Type {
+        let right = self.expr_infer(right_expr, errors);
+        // Only narrow if the RHS is a final class type (e.g., `type(x) != bool`)
+        if let Type::ClassDef(cls) = &right
+            && self.is_final(cls)
+        {
+            self.distribute_over_union(left, |l| {
+                if let Some((tparams, unwrapped)) = self.unwrap_class_object_silently(&right) {
+                    let (vs, unwrapped) =
+                        self.solver()
+                            .fresh_quantified(&tparams, unwrapped, self.uniques);
+                    let result = self.subtract(l, &unwrapped);
+                    let _specialization_errors = self.solver().finish_quantified(vs, false);
+                    result
+                } else {
+                    l.clone()
+                }
+            })
+        } else {
+            left.clone()
+        }
     }
 
     /// Turn an expression into a list of (type, allows_negative_narrow) pairs.
@@ -331,7 +362,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     if let Type::Type(box Type::ClassType(cls)) = &t {
                         // If `C` is not final, `type[C]` may be a subclass of `C`,
                         // making negative narrowing unsafe.
-                        let allows_negative_narrow = me.is_final(cls);
+                        let allows_negative_narrow = me.is_final(cls.class_object());
                         res.push((t, allows_negative_narrow));
                     } else {
                         for t in me.as_class_info(t) {
@@ -506,6 +537,21 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) -> Option<Type> {
+        // We narrow `X.__class__ == Y` the same way as `type(X) == Y`
+        if let FacetKind::Attribute(attr) = facet
+            && *attr == dunder::CLASS
+        {
+            match op {
+                AtomicNarrowOp::Is(v) | AtomicNarrowOp::Eq(v) => {
+                    let right = self.expr_infer(v, errors);
+                    return Some(self.narrow_isinstance(base, &right));
+                }
+                AtomicNarrowOp::IsNot(v) | AtomicNarrowOp::NotEq(v) => {
+                    return Some(self.narrow_type_not_eq(base, v, errors));
+                }
+                _ => {}
+            }
+        }
         match op {
             AtomicNarrowOp::Is(v) => {
                 let right = self.expr_infer(v, errors);
@@ -855,7 +901,15 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     return self.intersect(ty, &self.unions(key_types));
                 }
 
-                ty.clone()
+                // Check if the right operand is a mapping (e.g. dict[str, int]).
+                // If so, we can narrow the left operand to the mapping's key type.
+                if !self.behaves_like_any(&right_ty)
+                    && let Some((key_ty, _)) = self.unwrap_mapping(&right_ty)
+                {
+                    self.intersect(ty, &key_ty)
+                } else {
+                    ty.clone()
+                }
             }
             AtomicNarrowOp::NotIn(v) => {
                 // First, check for List, Tuple, and Set literal expressions (syntactic check,
@@ -1011,15 +1065,18 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 }
                 self.narrow_isinstance(ty, &right)
             }
-            AtomicNarrowOp::IsNotInstance(v, _source) => self.narrow_is_not_instance(ty, v, errors),
+            AtomicNarrowOp::IsNotInstance(v, source) => {
+                self.narrow_is_not_instance(ty, v, *source, errors)
+            }
             AtomicNarrowOp::TypeEq(v) => {
-                // If type(X) == Y then X can't be a subclass of Y
+                // If type(X) == Y then X has to be exactly Y, not a subclass of Y
                 // We can't model that, so we narrow it exactly like isinstance(X, Y)
                 let right = self.expr_infer(v, errors);
                 self.narrow_isinstance(ty, &right)
             }
-            // Even if type(X) != Y, X can still be a subclass of Y so we can't do any negative refinement
-            AtomicNarrowOp::TypeNotEq(_) => ty.clone(),
+            // If type(X) != Y, X can still be a subclass of Y so we can't do negative refinement
+            // unless Y is final, in which case X cannot be a subclass of Y
+            AtomicNarrowOp::TypeNotEq(v) => self.narrow_type_not_eq(ty, v, errors),
             AtomicNarrowOp::IsSubclass(v) => {
                 let right = self.expr_infer(v, errors);
                 self.narrow_issubclass(ty, &right, v.range(), errors)
@@ -1597,14 +1654,24 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             .is_some_and(|meta| meta.is_flag)
     }
 
+    pub(crate) fn with_type_for_exhaustiveness_check(&self, info: Arc<TypeInfo>) -> TypeInfo {
+        info.arc_clone().map_ty(|mut ty| {
+            self.expand_vars_mut(&mut ty);
+            match ty {
+                Type::SelfType(cls) => Type::ClassType(cls),
+                ty => ty,
+            }
+        })
+    }
+
     /// Determines if a type should be checked for match exhaustiveness.
     /// We check exhaustiveness when the type has a finite, known set of possible values.
     pub(crate) fn should_check_exhaustiveness(&self, ty: &Type) -> bool {
         match ty {
-            Type::ClassType(cls) | Type::SelfType(cls) => {
+            Type::ClassType(cls) => {
                 // Final classes can't have subclasses, so they are exhaustible, with the exception
                 // of Flag enums, whose members can be combined into new members via bitwise ops
-                !self.is_flag_enum(cls) && self.is_final(cls)
+                !self.is_flag_enum(cls) && self.is_final(cls.class_object())
                     // bool is effectively Literal[True] | Literal[False]
                     || cls.is_builtin("bool")
             }
@@ -1659,11 +1726,9 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         errors: &ErrorCollector,
     ) {
         let (op, narrow_range) = narrow_ops_for_fall_through;
-        let subject_info = self.get_idx(*subject_idx);
-        let mut subject_ty = subject_info.ty().clone();
-        self.expand_vars_mut(&mut subject_ty);
+        let subject_info = self.with_type_for_exhaustiveness_check(self.get_idx(*subject_idx));
         // We only check match exhaustiveness if the subject is an enum or a union of enum literals
-        if !self.should_check_exhaustiveness(&subject_ty) {
+        if !self.should_check_exhaustiveness(subject_info.ty()) {
             return;
         }
         let ignore_errors = self.error_swallower();
@@ -1681,7 +1746,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 // We need to make a `TypeInfo` rooted at `x` using the type of `x.foo`
                 let type_info = TypeInfo::of_ty(self.heap.mk_any_implicit());
                 let narrowing_subject_info =
-                    type_info.with_narrow(resolved_chain.facets(), subject_ty.clone());
+                    type_info.with_narrow(resolved_chain.facets(), subject_info.ty().clone());
                 let narrowed = self.narrow(
                     &narrowing_subject_info,
                     op.as_ref(),
@@ -1696,7 +1761,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if remaining_ty.is_never() || remaining_ty.is_any() {
             return;
         }
-        let subject_display = self.for_display(subject_ty);
+        let subject_display = self.for_display(subject_info.into_ty());
         let remaining_display = self.for_display(remaining_ty.clone());
         let ctx = TypeDisplayContext::new(&[&subject_display, &remaining_display]);
         let mut msg = vec1![format!(

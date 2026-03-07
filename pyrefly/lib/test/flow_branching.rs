@@ -320,6 +320,35 @@ except x2 as e7:
 );
 
 testcase!(
+    test_exception_handler_dynamic_tuple,
+    r#"
+from typing import assert_type
+
+class Exception1(Exception): pass
+class Exception2(Exception): pass
+
+# Dynamic tuple from tuple() constructor call
+error_list = [Exception1, Exception2]
+dynamic_errors = tuple(error_list)
+try:
+    pass
+except dynamic_errors as e1:
+    assert_type(e1, Exception1 | Exception2)
+
+# Union-typed parameter: single exception class or tuple of exception classes
+def handle(
+    errors: type[Exception] | tuple[type[Exception], ...],
+    value: str,
+) -> int:
+    try:
+        return int(value)
+    except errors as e2:
+        assert_type(e2, Exception)
+        return 0
+"#,
+);
+
+testcase!(
     test_exception_group_handler,
     r#"
 from typing import reveal_type
@@ -332,9 +361,9 @@ try:
 except* int as e1:  # E: Invalid exception class
     reveal_type(e1)  # E: revealed type: ExceptionGroup[int]
 except* Exception as e2:
-    reveal_type(e2)  # E: revealed type: ExceptionGroup[Exception]
+    reveal_type(e2)  # E: revealed type: ExceptionGroup
 except* ExceptionGroup as e3:  # E: Exception handler annotation in `except*` clause may not extend `BaseExceptionGroup`
-    reveal_type(e3)  # E: ExceptionGroup[ExceptionGroup[Exception]]
+    reveal_type(e3)  # E: ExceptionGroup[ExceptionGroup]
 except* (Exception1, Exception2) as e4:
     reveal_type(e4)  # E: ExceptionGroup[Exception1 | Exception2]
 except* Exception1 as e5:
@@ -994,7 +1023,6 @@ except as r: # E: Parse error: Expected one or more exception types
 );
 
 testcase!(
-    bug = "We unsoundly merge narrows dropping missing flow. See the incorrect reveal_type(y) result.",
     test_narrows_in_flow_merge_when_not_in_base_flow,
     r#"
 from typing import reveal_type
@@ -1010,10 +1038,8 @@ def f():
     elif isinstance(x, C):
         assert isinstance(y, C)
         pass
-    # We get this case right, but for a brittle reason: we negate the tests in the base flow.
-    reveal_type(x)  # E: revealed type: A | B | C
-    # The negation trick doesn't work here, and we get an incorrect narrow.
-    reveal_type(y)  # E: revealed type: B | C
+    reveal_type(x)  # E: revealed type: A
+    reveal_type(y)  # E: revealed type: A
 "#,
 );
 
@@ -1122,6 +1148,84 @@ def f(v):
         print(value)
     else:
         print(value)  # E: `value` is uninitialized
+    "#,
+);
+
+// Regression tests for https://github.com/facebook/pyrefly/issues/2382
+// Walrus operator in ternary test expression
+
+testcase!(
+    test_walrus_in_ternary_else_branch,
+    r#"
+def f(i: float) -> int:
+    return a if (a := round(i)) - 1 else a + 1
+    "#,
+);
+
+testcase!(
+    test_walrus_in_ternary_only_in_else,
+    r#"
+def f(x: int) -> int:
+    return 0 if (y := x) > 0 else y
+    "#,
+);
+
+// x is narrowed to int in the body (is not None) and
+// the else branch returns 0 (int), so the return type is int. No error.
+testcase!(
+    test_walrus_in_ternary_with_narrowing,
+    r#"
+from typing import assert_type
+def get() -> int | None: ...
+def f() -> int:
+    return x if (x := get()) is not None else 0
+    "#,
+);
+
+testcase!(
+    test_walrus_ternary_truthiness_narrowing,
+    r#"
+from typing import assert_type
+def get() -> str | None: ...
+def f() -> str:
+    return x if (x := get()) else "default"
+    "#,
+);
+
+testcase!(
+    test_walrus_in_ternary_short_circuit,
+    r#"
+def condition() -> bool: ...
+def get() -> int: ...
+def f1() -> int:
+    return x if condition() and (x := get()) else 0  # no error
+# BoolOp merging uses lax handling, so `x` is treated as defined even though
+# `x := get()` may not execute. This is a known false negative from BoolOp laxness.
+def f2() -> int:
+    return x if condition() or (x := get()) else 0  # false negative
+def f3() -> int:
+    return x if condition() and (x := get()) else x  # false negative
+    "#,
+);
+
+// Walrus in outer ternary test: `a` should be visible in both branches.
+// Currently this works because truthiness narrowing on `a` adds it to the
+// else flow, masking the uninitialized status.
+testcase!(
+    test_walrus_in_nested_ternary_outer,
+    r#"
+def f(v: int) -> int:
+    return (a if a > 0 else -a) if (a := v) else -a
+    "#,
+);
+
+testcase!(
+    test_walrus_in_nested_ternary_inner,
+    r#"
+def condition() -> bool: ...
+def get() -> int: ...
+def f() -> int:
+    return (b if (b := get()) > 0 else 0) if condition() else -1
     "#,
 );
 
@@ -1489,7 +1593,7 @@ def f(x: str | None):
 testcase!(
     test_noreturn_all_branches_terminate,
     r#"
-from typing import assert_type, NoReturn
+from typing import assert_type, NoReturn, Never
 
 def raises() -> NoReturn:
     raise Exception()
@@ -1499,10 +1603,7 @@ def f(x: int | str):
         raises()
     else:
         raises()
-    # All branches terminate with a NoReturn call; when Pyrefly
-    # encounters this it just ignores the NoReturn and goes ahead
-    # producing the union.
-    assert_type(x, int | str)
+    assert_type(x, Never)
 "#,
 );
 
@@ -1678,5 +1779,45 @@ def f(x: int | str, y: int | str) -> str:  # E: Function declared to return `str
     elif isinstance(y, str):
         return "y is str"
     # Different subjects in different branches - cannot determine exhaustiveness
+"#,
+);
+
+// Issue #2406: NoReturn in except block should make variable always initialized
+testcase!(
+    test_noreturn_try_except_simple,
+    r#"
+from typing import NoReturn
+
+def foo() -> NoReturn:
+    raise ValueError('')
+
+def main() -> None:
+    try:
+        node = 1
+    except Exception:
+        foo()
+    print(node)
+"#,
+);
+
+testcase!(
+    test_noreturn_try_except_if_nested,
+    r#"
+from typing import NoReturn
+
+def foo() -> NoReturn:
+    raise ValueError('')
+
+def main(resolve: bool) -> None:
+    try:
+        node = 1
+    except Exception as exc:
+        foo()
+    if resolve:
+        try:
+            node = 2
+        except Exception:
+            foo()
+    print(node)
 "#,
 );

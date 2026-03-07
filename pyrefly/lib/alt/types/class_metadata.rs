@@ -64,6 +64,8 @@ pub struct ClassMetadata {
     is_attrs_class: bool,
     django_model_metadata: Option<DjangoModelMetadata>,
     is_marshmallow_schema: bool,
+    /// Whether this class is a metaclass (i.e., a subclass of `type`).
+    is_metaclass: bool,
 }
 
 impl VisitMut<Type> for ClassMetadata {
@@ -102,6 +104,7 @@ impl ClassMetadata {
         is_attrs_class: bool,
         django_model_metadata: Option<DjangoModelMetadata>,
         is_marshmallow_schema: bool,
+        is_metaclass: bool,
     ) -> ClassMetadata {
         ClassMetadata {
             metaclass,
@@ -125,6 +128,7 @@ impl ClassMetadata {
             is_attrs_class,
             django_model_metadata,
             is_marshmallow_schema,
+            is_metaclass,
         }
     }
 
@@ -151,6 +155,7 @@ impl ClassMetadata {
             is_attrs_class: false,
             django_model_metadata: None,
             is_marshmallow_schema: false,
+            is_metaclass: false,
         }
     }
 
@@ -189,6 +194,11 @@ impl ClassMetadata {
 
     pub fn is_marshmallow_schema(&self) -> bool {
         self.is_marshmallow_schema
+    }
+
+    /// Whether this class is a metaclass (i.e., a subclass of `type`).
+    pub fn is_metaclass(&self) -> bool {
+        self.is_metaclass
     }
 
     pub fn is_attrs_class(&self) -> bool {
@@ -328,6 +338,12 @@ impl ClassSynthesizedField {
             inner: Arc::new(ClassField::new_synthesized(ty)),
         }
     }
+
+    pub fn new_classvar(ty: Type) -> Self {
+        Self {
+            inner: Arc::new(ClassField::new_synthesized_classvar(ty)),
+        }
+    }
 }
 
 /// A class's synthesized fields, such as a dataclass's `__init__` method.
@@ -441,6 +457,9 @@ pub struct EnumMetadata {
 #[derive(Clone, Debug, TypeEq, PartialEq, Eq)]
 pub struct NamedTupleMetadata {
     pub elements: SmallSet<Name>,
+    /// If true, the namedtuple fields were dynamically generated (e.g., using a
+    /// generator or variable) and couldn't be statically resolved.
+    pub has_dynamic_fields: bool,
 }
 
 /// Defaults for `init_by_name` and `init_by_default`, per-field flags that control the name of
