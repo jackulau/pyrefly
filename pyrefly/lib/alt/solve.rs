@@ -4952,18 +4952,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 );
                 Arc::new(YieldResult::any_error(self.heap))
             }
-            BindingYield::Unreachable(x) => {
-                if let Some(expr) = x.value.as_ref() {
-                    self.expr_infer(expr, errors);
-                }
-                self.error(
-                    errors,
-                    x.range,
-                    ErrorInfo::Kind(ErrorKind::Unreachable),
-                    "This `yield` expression is unreachable".to_owned(),
-                );
-                Arc::new(YieldResult::any_error(self.heap))
-            }
         }
     }
 
@@ -5041,16 +5029,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     x.range,
                     ErrorInfo::Kind(ErrorKind::InvalidYield),
                     "Invalid `yield from` outside of a function".to_owned(),
-                );
-                Arc::new(YieldFromResult::any_error(self.heap))
-            }
-            BindingYieldFrom::Unreachable(x) => {
-                self.expr_infer(&x.value, errors);
-                self.error(
-                    errors,
-                    x.range,
-                    ErrorInfo::Kind(ErrorKind::Unreachable),
-                    "This `yield from` expression is unreachable".to_owned(),
                 );
                 Arc::new(YieldFromResult::any_error(self.heap))
             }

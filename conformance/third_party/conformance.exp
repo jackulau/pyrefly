@@ -1748,33 +1748,11 @@
     {
       "code": -2,
       "column": 5,
-      "concise_description": "This `yield` expression is unreachable",
-      "description": "This `yield` expression is unreachable",
-      "line": 140,
-      "name": "unreachable",
-      "severity": "warn",
-      "stop_column": 13,
-      "stop_line": 140
-    },
-    {
-      "code": -2,
-      "column": 5,
-      "concise_description": "This `yield` expression is unreachable",
-      "description": "This `yield` expression is unreachable",
-      "line": 145,
-      "name": "unreachable",
-      "severity": "warn",
-      "stop_column": 13,
-      "stop_line": 145
-    },
-    {
-      "code": -2,
-      "column": 5,
-      "concise_description": "This `yield` expression is unreachable",
-      "description": "This `yield` expression is unreachable",
+      "concise_description": "Expected to yield a value of type `int`, but a bare `yield` gives `None` instead",
+      "description": "Expected to yield a value of type `int`, but a bare `yield` gives `None` instead",
       "line": 190,
-      "name": "unreachable",
-      "severity": "warn",
+      "name": "invalid-yield",
+      "severity": "error",
       "stop_column": 10,
       "stop_line": 190
     }

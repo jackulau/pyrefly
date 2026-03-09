@@ -416,29 +416,20 @@ impl<'a> BindingsBuilder<'a> {
             .into_boxed_slice();
 
         // Collect the keys of yield expressions.
+        // We don't emit unreachable errors for yield/yield from because
+        // `return; yield` is a common pattern to force a function to be a generator.
         let yield_keys = yields_and_returns
             .yields
-            .into_map(|(idx, x, is_unreachable)| {
-                self.insert_binding_idx(
-                    idx,
-                    if is_unreachable {
-                        BindingYield::Unreachable(x)
-                    } else {
-                        BindingYield::Yield(return_ann, x)
-                    },
-                )
+            .into_map(|(idx, x, _is_unreachable)| {
+                self.insert_binding_idx(idx, BindingYield::Yield(return_ann, x))
             })
             .into_boxed_slice();
         let yield_from_keys = yields_and_returns
             .yield_froms
-            .into_map(|(idx, x, is_unreachable)| {
+            .into_map(|(idx, x, _is_unreachable)| {
                 self.insert_binding_idx(
                     idx,
-                    if is_unreachable {
-                        BindingYieldFrom::Unreachable(x)
-                    } else {
-                        BindingYieldFrom::YieldFrom(return_ann, IsAsync::new(is_async), x)
-                    },
+                    BindingYieldFrom::YieldFrom(return_ann, IsAsync::new(is_async), x),
                 )
             })
             .into_boxed_slice();

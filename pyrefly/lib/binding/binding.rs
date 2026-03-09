@@ -3016,11 +3016,12 @@ impl BindingLegacyTypeParam {
     }
 }
 
+/// Unlike `ReturnExplicit`, yields have no `Unreachable` variant because
+/// `return; yield` is a common Python pattern to force a function to be a generator.
 #[derive(Clone, Debug)]
 pub enum BindingYield {
     Yield(Option<Idx<KeyAnnotation>>, ExprYield),
     Invalid(ExprYield),
-    Unreachable(ExprYield),
 }
 
 impl BindingYield {
@@ -3028,7 +3029,6 @@ impl BindingYield {
         match self {
             Self::Yield(_, x) => x,
             Self::Invalid(x) => x,
-            Self::Unreachable(x) => x,
         }
     }
 }
@@ -3040,11 +3040,11 @@ impl DisplayWith<Bindings> for BindingYield {
     }
 }
 
+/// See `BindingYield` for why there is no `Unreachable` variant.
 #[derive(Clone, Debug)]
 pub enum BindingYieldFrom {
     YieldFrom(Option<Idx<KeyAnnotation>>, IsAsync, ExprYieldFrom),
     Invalid(ExprYieldFrom),
-    Unreachable(ExprYieldFrom),
 }
 
 impl BindingYieldFrom {
@@ -3052,7 +3052,6 @@ impl BindingYieldFrom {
         match self {
             Self::YieldFrom(_, _, x) => x,
             Self::Invalid(x) => x,
-            Self::Unreachable(x) => x,
         }
     }
 }

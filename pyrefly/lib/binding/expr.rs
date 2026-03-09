@@ -477,28 +477,19 @@ impl<'a> BindingsBuilder<'a> {
         self.ensure_expr(&mut lambda.body, usage);
         let (yields_and_returns, _, _, _) = self.scopes.pop_function_scope();
         let mut yield_keys = Vec::new();
-        for (idx, y, is_unreachable) in yields_and_returns.yields {
+        // We don't emit unreachable errors for yield/yield from because
+        // `return; yield` is a common pattern to force a function to be a generator.
+        for (idx, y, _is_unreachable) in yields_and_returns.yields {
             yield_keys.push(idx);
-            self.insert_binding_idx(
-                idx,
-                if is_unreachable {
-                    BindingYield::Unreachable(y)
-                } else {
-                    BindingYield::Yield(None, y)
-                },
-            );
+            self.insert_binding_idx(idx, BindingYield::Yield(None, y));
         }
         let mut yield_from_keys = Vec::new();
-        for (idx, y, is_unreachable) in yields_and_returns.yield_froms {
+        for (idx, y, _is_unreachable) in yields_and_returns.yield_froms {
             yield_from_keys.push(idx);
             self.insert_binding_idx(
                 idx,
-                if is_unreachable {
-                    BindingYieldFrom::Unreachable(y)
-                } else {
-                    // Lambdas cannot be async in Python, so this is always false.
-                    BindingYieldFrom::YieldFrom(None, IsAsync::new(false), y)
-                },
+                // Lambdas cannot be async in Python, so this is always false.
+                BindingYieldFrom::YieldFrom(None, IsAsync::new(false), y),
             );
         }
         if !yield_keys.is_empty() || !yield_from_keys.is_empty() {

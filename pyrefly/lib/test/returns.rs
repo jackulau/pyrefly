@@ -363,12 +363,14 @@ def test():
 "#,
 );
 
+// `return; yield` is a common pattern to force a function to be a generator.
+// We suppress unreachable errors for yield statements.
 testcase!(
     test_unreachable_yield_after_return,
     r#"
 def test():
     return 1
-    yield 2 # E: This `yield` expression is unreachable
+    yield 2
 "#,
 );
 
@@ -426,12 +428,56 @@ def test():
 "#,
 );
 
+// `return; yield from` is a common pattern to force a function to be a generator.
+// We suppress unreachable errors for yield from statements.
 testcase!(
     test_unreachable_yield_from_after_return,
     r#"
 def test():
     return 1
-    yield from [2, 3] # E: This `yield from` expression is unreachable
+    yield from [2, 3]
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/2645
+testcase!(
+    test_generator_pattern_return_then_yield,
+    r#"
+from typing import Iterable, AsyncIterable
+
+def generator23() -> Iterable[str]:
+    return
+    yield ""
+
+async def generator24() -> AsyncIterable[str]:
+    return
+    yield ""
+"#,
+);
+
+// Yield after raise is also not flagged as unreachable, consistent with
+// suppressing unreachable errors for all yields.
+testcase!(
+    test_no_unreachable_yield_after_raise,
+    r#"
+from typing import Generator
+
+def gen() -> Generator[str, None, None]:
+    raise NotImplementedError
+    yield "ok"
+"#,
+);
+
+// Yield from after raise is also not flagged as unreachable, consistent with
+// suppressing unreachable errors for all yields.
+testcase!(
+    test_no_unreachable_yield_from_after_raise,
+    r#"
+from typing import Generator
+
+def gen() -> Generator[str, None, None]:
+    raise NotImplementedError
+    yield from ["ok"]
 "#,
 );
 
